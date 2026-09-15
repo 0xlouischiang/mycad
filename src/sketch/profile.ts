@@ -19,9 +19,11 @@
 import type {
   ArcEntity,
   CircleEntity,
+  EllipseEntity,
   LineEntity,
   Sketch,
   SketchPoint,
+  SplineEntity,
 } from "../model/sketch";
 
 /** A single edge of an extracted profile, described in 2D plane coords. */
@@ -37,11 +39,27 @@ export type ProfileEdge =
       x2: number;
       y2: number;
     }
-  | { kind: "circle"; cx: number; cy: number; radius: number };
+  | { kind: "circle"; cx: number; cy: number; radius: number }
+  | {
+      kind: "ellipse";
+      cx: number;
+      cy: number;
+      major: number;
+      minor: number;
+      rotation: number;
+    }
+  | {
+      kind: "spline";
+      /** Ordered interpolation points, plane coords, oriented along the walk. */
+      pts: { u: number; v: number }[];
+    };
 
 export interface Profile {
   edges: ProfileEdge[];
-  /** True if the profile is a single full circle (one closed curve). */
+  /**
+   * True if the profile is a single full closed curve (circle or ellipse) —
+   * built as one wire edge rather than a chain.
+   */
   isCircle: boolean;
 }
 
@@ -56,15 +74,19 @@ export function extractProfile(sketch: Sketch): ProfileResult {
   const pointById = new Map(sketch.points.map((p) => [p.id, p]));
   const P = (id: string): SketchPoint | undefined => pointById.get(id);
 
-  // A lone circle is a complete closed profile by itself.
+  // A lone circle or ellipse is a complete closed profile by itself.
   const circles = sketch.entities.filter(
     (e): e is CircleEntity => e.type === "circle",
   );
+  const ellipses = sketch.entities.filter(
+    (e): e is EllipseEntity => e.type === "ellipse",
+  );
   const chainable = sketch.entities.filter(
-    (e): e is LineEntity | ArcEntity => e.type === "line" || e.type === "arc",
+    (e): e is LineEntity | ArcEntity | SplineEntity =>
+      e.type === "line" || e.type === "arc" || e.type === "spline",
   );
 
-  if (chainable.length === 0 && circles.length === 1) {
+  if (chainable.length === 0 && circles.length === 1 && ellipses.length === 0) {
     const c = circles[0];
     const center = P(c.center);
     if (!center) return { ok: false, error: "Circle center point missing" };
@@ -73,6 +95,28 @@ export function extractProfile(sketch: Sketch): ProfileResult {
       profile: {
         isCircle: true,
         edges: [{ kind: "circle", cx: center.u, cy: center.v, radius: c.radius }],
+      },
+    };
+  }
+
+  if (chainable.length === 0 && ellipses.length === 1 && circles.length === 0) {
+    const el = ellipses[0];
+    const center = P(el.center);
+    if (!center) return { ok: false, error: "Ellipse center point missing" };
+    return {
+      ok: true,
+      profile: {
+        isCircle: true, // single closed curve
+        edges: [
+          {
+            kind: "ellipse",
+            cx: center.u,
+            cy: center.v,
+            major: el.majorRadius,
+            minor: el.minorRadius,
+            rotation: el.rotation,
+          },
+        ],
       },
     };
   }
@@ -93,12 +137,14 @@ export function extractProfile(sketch: Sketch): ProfileResult {
     id: string;
     a: string; // start point id
     b: string; // end point id
-    entity: LineEntity | ArcEntity;
+    entity: LineEntity | ArcEntity | SplineEntity;
   }
   const segs: Seg[] = chainable.map((e) =>
     e.type === "line"
       ? { id: e.id, a: e.p1, b: e.p2, entity: e }
-      : { id: e.id, a: e.start, b: e.end, entity: e },
+      : e.type === "spline"
+        ? { id: e.id, a: e.points[0], b: e.points[e.points.length - 1], entity: e }
+        : { id: e.id, a: e.start, b: e.end, entity: e },
   );
 
   // Group endpoints by coincident location so snapped-but-distinct point ids
@@ -178,12 +224,20 @@ export function extractProfile(sketch: Sketch): ProfileResult {
       const t = coordFor(forward ? e.p2 : e.p1);
       edges.push({ kind: "line", x1: s.u, y1: s.v, x2: t.u, y2: t.v });
       cursor = keyOf(forward ? seg.b : seg.a);
+    } else if (e.type === "spline") {
+      // Emit the interpolation points in walk order.
+      const ptIds = forward ? e.points : [...e.points].reverse();
+      edges.push({ kind: "spline", pts: ptIds.map(coordFor) });
+      cursor = keyOf(forward ? seg.b : seg.a);
     } else {
       const center = coordFor(e.center);
       const s = coordFor(forward ? e.start : e.end);
       const t = coordFor(forward ? e.end : e.start);
+      // The stored sweep is start→end; traversing the edge backward flips it.
+      const storedCcw = (e.sweep ?? "ccw") === "ccw";
+      const ccw = forward ? storedCcw : !storedCcw;
       // Compute a mid point on the arc (for makeArcEdge's 3-point form).
-      const mid = arcMidpoint(center, s, t);
+      const mid = arcMidpoint(center, s, t, ccw);
       edges.push({
         kind: "arc",
         x1: s.u,
@@ -227,17 +281,25 @@ function buildNodeKeys(points: SketchPoint[]): Map<string, string> {
   return keys;
 }
 
-/** A point on the arc between start and end, on the circle around center. */
+/**
+ * A point on the arc between start and end, on the circle around center.
+ * `ccw` selects which of the two arcs: counter-clockwise from start to end
+ * (true) or clockwise (false). This disambiguates semicircles (e.g. slot caps).
+ */
 function arcMidpoint(
   center: { u: number; v: number },
   start: { u: number; v: number },
   end: { u: number; v: number },
+  ccw = true,
 ): { u: number; v: number } {
   const r = Math.hypot(start.u - center.u, start.v - center.v);
-  let a0 = Math.atan2(start.v - center.v, start.u - center.u);
+  const a0 = Math.atan2(start.v - center.v, start.u - center.u);
   let a1 = Math.atan2(end.v - center.v, end.u - center.u);
-  // Take the CCW arc from start to end (matches SketchCanvas rendering).
-  while (a1 <= a0) a1 += 2 * Math.PI;
+  if (ccw) {
+    while (a1 <= a0) a1 += 2 * Math.PI; // sweep upward (CCW)
+  } else {
+    while (a1 >= a0) a1 -= 2 * Math.PI; // sweep downward (CW)
+  }
   const am = (a0 + a1) / 2;
   return { u: center.u + r * Math.cos(am), v: center.v + r * Math.sin(am) };
 }
@@ -248,13 +310,18 @@ function arcMidpoint(
  * check is deferred). Adjacent edges sharing an endpoint are allowed to touch.
  */
 function selfIntersects(edges: ProfileEdge[]): boolean {
-  const segs = edges.map((e) =>
-    e.kind === "circle"
-      ? null
-      : e.kind === "line"
-        ? { x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2 }
-        : { x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2 }, // arc chord
-  );
+  const segs = edges.map((e) => {
+    // circle/ellipse are standalone closed curves (never in a chain), so they
+    // contribute no chord segment to the self-intersection test.
+    if (e.kind === "line" || e.kind === "arc")
+      return { x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2 }; // line, or arc chord
+    if (e.kind === "spline" && e.pts.length >= 2) {
+      const a = e.pts[0];
+      const b = e.pts[e.pts.length - 1];
+      return { x1: a.u, y1: a.v, x2: b.u, y2: b.v }; // spline endpoint chord
+    }
+    return null;
+  });
   for (let i = 0; i < segs.length; i++) {
     const a = segs[i];
     if (!a) continue;

@@ -17,4 +17,21 @@ export default defineConfig({
     // optimizer preserves the worker's import.meta.url-based .wasm resolution.
     exclude: ["occt-wasm"],
   },
+  build: {
+    // three.js is legitimately ~525 KB as its own vendor chunk and can't be
+    // split further without deep tree-shaking; raise the warning threshold so
+    // the build output isn't perpetually noisy about an intentional split.
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        // Split heavy vendor libs into their own chunks so they cache
+        // independently of app code and the initial parse is smaller. three.js
+        // dominates; react/react-dom are stable across releases.
+        manualChunks: {
+          three: ["three"],
+          react: ["react", "react-dom"],
+        },
+      },
+    },
+  },
 });

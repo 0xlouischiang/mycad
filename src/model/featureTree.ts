@@ -24,7 +24,7 @@
  */
 
 import type { Sketch, SketchPlaneId } from "./sketch";
-import type { EdgeRef } from "./edgeRef";
+import type { EdgeRef, FaceRef } from "./edgeRef";
 
 /** How a feature's solid combines with the accumulated result before it. */
 export type BooleanOperation = "new" | "add" | "remove";
@@ -41,7 +41,14 @@ export type FeatureType =
   | "linearPattern"
   | "circularPattern"
   | "linked"
-  | "revolve";
+  | "revolve"
+  | "shell"
+  | "draft"
+  | "loft"
+  | "sweep"
+  | "hole"
+  | "split"
+  | "import";
 
 /** A 3D position offset applied to a primitive before combining. */
 export interface Vec3 {
@@ -58,6 +65,15 @@ interface FeatureBase {
   name: string;
   /** Suppressed features are skipped during regeneration but kept in the tree. */
   suppressed: boolean;
+  /**
+   * Optional expression overrides for numeric params, keyed by param name
+   * (e.g. "dx", "distance", "radius"). When present, the store evaluates the
+   * expression against the Part Studio's variable scope and writes the result
+   * into the corresponding numeric param BEFORE regeneration — so the worker
+   * always receives plain numbers and regen.ts stays expression-agnostic.
+   * A param with no entry here is just its literal number.
+   */
+  exprs?: Record<string, string>;
 }
 
 /**
@@ -114,7 +130,105 @@ export interface ExtrudeFeature extends FeatureBase {
   params: {
     distance: number;
     flip: boolean;
+    /**
+     * Symmetric extrude: when true, extrudes `distance` in BOTH normal
+     * directions from the sketch plane (total length 2*distance), centered on
+     * the plane. `flip` is ignored when symmetric.
+     */
+    symmetric?: boolean;
   };
+}
+
+/**
+ * Split the running body by a base plane (offset along its normal) and keep one
+ * side. Implemented as a half-space cut: a large box covering the discard side
+ * is subtracted. A modifier (no boolean operation field).
+ */
+export interface SplitFeature extends FeatureBase {
+  type: "split";
+  params: {
+    plane: SketchPlaneId;
+    /** Offset of the cut plane along its normal. */
+    offset: number;
+    /** Which side of the plane to keep: along +normal or -normal. */
+    keep: "positive" | "negative";
+  };
+}
+
+/**
+ * A parametric hole cut into the running body. MVP: positioned by explicit
+ * (x, y) on a base plane, drilled along that plane's normal from `startOffset`.
+ * Three types: simple (straight bore), counterbore (a wider flat recess at the
+ * mouth), countersink (a conical recess at the mouth). It's a modifier — it
+ * cuts the accumulated body in place (no boolean operation field).
+ */
+export interface HoleFeature extends FeatureBase {
+  type: "hole";
+  params: {
+    /** Base plane the hole is positioned on / drilled normal to. */
+    plane: SketchPlaneId;
+    /** In-plane position of the hole axis. */
+    x: number;
+    y: number;
+    /** Offset of the mouth along the plane normal (where drilling starts). */
+    startOffset: number;
+    /** Drill direction along the normal: +1 or -1. */
+    dir: 1 | -1;
+    diameter: number;
+    depth: number;
+    holeType: "simple" | "counterbore" | "countersink";
+    /** Counterbore: recess diameter + depth. */
+    cboreDiameter: number;
+    cboreDepth: number;
+    /** Countersink: rim diameter + included angle (degrees). */
+    csinkDiameter: number;
+    csinkAngle: number;
+  };
+}
+
+/**
+ * Imported geometry from a STEP or STL file, held inline (the file text is
+ * stored in the tree so it persists with the document). Combined into the body
+ * via its operation like any solid feature. STL yields a mesh-derived solid;
+ * STEP yields true B-rep.
+ */
+export interface ImportFeature extends FeatureBase {
+  type: "import";
+  format: "step" | "stl";
+  /** Raw file contents (STEP/STL ascii text). */
+  data: string;
+  /** Original filename, for display. */
+  fileName: string;
+  operation: BooleanOperation;
+}
+
+/**
+ * Loft a solid through an ordered list of sketch profiles (2+). Each sketch's
+ * closed profile becomes a section wire; OCCT lofts a skin through them. Order
+ * matters — it's the section sequence.
+ */
+export interface LoftFeature extends FeatureBase {
+  type: "loft";
+  /** Ordered sketch feature ids to loft through (>= 2). */
+  sketchIds: string[];
+  operation: BooleanOperation;
+  params: {
+    /** Ruled = straight (linear) transitions between sections vs. smoothed. */
+    ruled: boolean;
+  };
+}
+
+/**
+ * Sweep a profile sketch along a path sketch. The profile is a closed loop; the
+ * path is an open (or closed) chain of connected edges. Produces a solid.
+ */
+export interface SweepFeature extends FeatureBase {
+  type: "sweep";
+  /** Sketch feature id of the closed profile to sweep. */
+  profileSketchId: string;
+  /** Sketch feature id of the path (spine) to sweep along. */
+  pathSketchId: string;
+  operation: BooleanOperation;
 }
 
 /**
@@ -192,6 +306,34 @@ export interface ChamferFeature extends FeatureBase {
 }
 
 /**
+ * Shell: hollow the body by removing the referenced faces and offsetting the
+ * remaining walls inward by `thickness`. Faces referenced by stable geometric
+ * signature (FaceRef, same scheme as edges — see edgeRef.ts). Errors + keeps
+ * prior body if no referenced face resolves.
+ */
+export interface ShellFeature extends FeatureBase {
+  type: "shell";
+  faceRefs: FaceRef[];
+  params: {
+    thickness: number;
+  };
+}
+
+/**
+ * Draft: taper the referenced faces by `angle` degrees about a pull direction
+ * (a base axis). Common for molded/cast parts. Faces by stable FaceRef.
+ */
+export interface DraftFeature extends FeatureBase {
+  type: "draft";
+  faceRefs: FaceRef[];
+  params: {
+    /** Pull direction (the draft reference direction). */
+    direction: "x" | "y" | "z";
+    angle: number; // degrees
+  };
+}
+
+/**
  * Mirror the accumulated body across a base plane and fuse the reflection back.
  *
  * MVP simplification (noted per the brief's "corners cut" requirement): mirror
@@ -247,7 +389,14 @@ export type Feature =
   | LinearPatternFeature
   | CircularPatternFeature
   | LinkedFeature
-  | RevolveFeature;
+  | RevolveFeature
+  | ShellFeature
+  | DraftFeature
+  | LoftFeature
+  | SweepFeature
+  | HoleFeature
+  | SplitFeature
+  | ImportFeature;
 
 /** Features that create a solid and combine via boolean (new/add/remove). */
 export type SolidFeature =
@@ -255,10 +404,22 @@ export type SolidFeature =
   | CylinderFeature
   | ExtrudeFeature
   | LinkedFeature
-  | RevolveFeature;
+  | RevolveFeature
+  | LoftFeature
+  | SweepFeature
+  | ImportFeature;
 
-/** Edge-referencing modifiers of the accumulated body (fillet/chamfer). */
-export type ModifierFeature = FilletFeature | ChamferFeature;
+/**
+ * Modifiers of the accumulated body: fillet/chamfer reference edges; shell/
+ * draft reference faces. All modify in place (no boolean operation).
+ */
+export type ModifierFeature =
+  | FilletFeature
+  | ChamferFeature
+  | ShellFeature
+  | DraftFeature
+  | HoleFeature
+  | SplitFeature;
 
 /** Whole-body transforms (mirror + patterns) that replicate/reflect the body. */
 export type TransformFeature =
@@ -273,13 +434,23 @@ export function isSolidFeature(f: Feature): f is SolidFeature {
     f.type === "cylinder" ||
     f.type === "extrude" ||
     f.type === "linked" ||
-    f.type === "revolve"
+    f.type === "revolve" ||
+    f.type === "loft" ||
+    f.type === "sweep" ||
+    f.type === "import"
   );
 }
 
-/** True if a feature modifies the running body via edge selection. */
+/** True if a feature modifies the running body in place (fillet/chamfer/shell/draft). */
 export function isModifierFeature(f: Feature): f is ModifierFeature {
-  return f.type === "fillet" || f.type === "chamfer";
+  return (
+    f.type === "fillet" ||
+    f.type === "chamfer" ||
+    f.type === "shell" ||
+    f.type === "draft" ||
+    f.type === "hole" ||
+    f.type === "split"
+  );
 }
 
 /** True if a feature replicates/reflects the whole running body. */
@@ -391,6 +562,41 @@ export function makeRevolveFeature(
   };
 }
 
+/** Create a loft feature through the given ordered sketch profiles. */
+export function makeLoftFeature(
+  sketchIds: string[],
+  index: number,
+  operation: BooleanOperation,
+): LoftFeature {
+  return {
+    id: newFeatureId(),
+    type: "loft",
+    name: `Loft ${index}`,
+    suppressed: false,
+    sketchIds: [...sketchIds],
+    operation,
+    params: { ruled: false },
+  };
+}
+
+/** Create a sweep feature sweeping a profile sketch along a path sketch. */
+export function makeSweepFeature(
+  profileSketchId: string,
+  pathSketchId: string,
+  index: number,
+  operation: BooleanOperation,
+): SweepFeature {
+  return {
+    id: newFeatureId(),
+    type: "sweep",
+    name: `Sweep ${index}`,
+    suppressed: false,
+    profileSketchId,
+    pathSketchId,
+    operation,
+  };
+}
+
 /** Create a fillet feature rounding the given edges (by geometric ref). */
 export function makeFilletFeature(
   edgeRefs: EdgeRef[],
@@ -418,6 +624,91 @@ export function makeChamferFeature(
     suppressed: false,
     edgeRefs: [...edgeRefs],
     params: { distance: 3 },
+  };
+}
+
+/** Create a shell feature hollowing the body, removing the given faces. */
+export function makeShellFeature(
+  faceRefs: FaceRef[],
+  index: number,
+): ShellFeature {
+  return {
+    id: newFeatureId(),
+    type: "shell",
+    name: `Shell ${index}`,
+    suppressed: false,
+    faceRefs: [...faceRefs],
+    params: { thickness: 2 },
+  };
+}
+
+/** Create a draft feature tapering the given faces. */
+export function makeDraftFeature(
+  faceRefs: FaceRef[],
+  index: number,
+): DraftFeature {
+  return {
+    id: newFeatureId(),
+    type: "draft",
+    name: `Draft ${index}`,
+    suppressed: false,
+    faceRefs: [...faceRefs],
+    params: { direction: "z", angle: 5 },
+  };
+}
+
+/** Create a hole feature (simple, positioned at origin, drilling down -Z). */
+export function makeHoleFeature(index: number): HoleFeature {
+  return {
+    id: newFeatureId(),
+    type: "hole",
+    name: `Hole ${index}`,
+    suppressed: false,
+    params: {
+      plane: "XY",
+      x: 0,
+      y: 0,
+      startOffset: 0,
+      dir: -1,
+      diameter: 8,
+      depth: 20,
+      holeType: "simple",
+      cboreDiameter: 14,
+      cboreDepth: 5,
+      csinkDiameter: 14,
+      csinkAngle: 90,
+    },
+  };
+}
+
+/** Create an import feature holding STEP/STL file text. */
+export function makeImportFeature(
+  format: "step" | "stl",
+  data: string,
+  fileName: string,
+  index: number,
+  operation: BooleanOperation,
+): ImportFeature {
+  return {
+    id: newFeatureId(),
+    type: "import",
+    name: `Import ${index}`,
+    suppressed: false,
+    format,
+    data,
+    fileName,
+    operation,
+  };
+}
+
+/** Create a split feature cutting the body by a base plane, keeping one side. */
+export function makeSplitFeature(index: number): SplitFeature {
+  return {
+    id: newFeatureId(),
+    type: "split",
+    name: `Split ${index}`,
+    suppressed: false,
+    params: { plane: "XY", offset: 0, keep: "positive" },
   };
 }
 

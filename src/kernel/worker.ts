@@ -21,11 +21,13 @@ import wasmUrl from "occt-wasm/dist/occt-wasm.wasm?url";
 import type {
   CmdExport,
   CmdMakeBox,
+  CmdMassProps,
   CmdRegenerate,
   EdgePayload,
   ExportResult,
   InitResult,
   KernelCommand,
+  MassPropsResult,
   MeshPayload,
   RegenResult,
   RequestMessage,
@@ -34,7 +36,7 @@ import type {
   TessellationQuality,
 } from "./protocol";
 import { collectTransferables } from "./protocol";
-import { regenerate, exportTree } from "./regen";
+import { regenerate, exportTree, massPropsOfTree } from "./regen";
 
 /** Lazily-initialized kernel. Null until the first `init` command completes. */
 let kernel: OcctKernel | null = null;
@@ -123,14 +125,23 @@ function handleExport(cmd: CmdExport): ExportResult {
   return { format: cmd.format, data };
 }
 
+function handleMassProps(cmd: CmdMassProps): MassPropsResult {
+  const k = requireKernel();
+  return massPropsOfTree(k, cmd.tree);
+}
+
 async function dispatch(
   command: KernelCommand,
-): Promise<InitResult | ShapeResult | RegenResult | ExportResult> {
+): Promise<
+  InitResult | ShapeResult | RegenResult | ExportResult | MassPropsResult
+> {
   switch (command.op) {
     case "init":
       return handleInit();
     case "export":
       return handleExport(command);
+    case "massProps":
+      return handleMassProps(command);
     case "makeBox":
       return handleMakeBox(command);
     case "regenerate":

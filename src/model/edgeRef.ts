@@ -63,3 +63,24 @@ export function edgeRefFromPoints(points: Float32Array | number[]): EdgeRef {
   }
   return edgeRefFromCenter((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2);
 }
+
+// ---------------------------------------------------------------------------
+// Face references (same geometric-signature scheme, for shell/draft)
+// ---------------------------------------------------------------------------
+
+/** A stable reference to a FACE by rounded bbox-center (same scheme as edges). */
+export type FaceRef = string;
+
+/** Build a FaceRef from a 3D bounding-box center. */
+export function faceRefFromCenter(cx: number, cy: number, cz: number): FaceRef {
+  return edgeRefFromCenter(cx, cy, cz);
+}
+
+/**
+ * Build a FaceRef from a flat array of a face's vertex positions (e.g. the
+ * mesh positions of one faceGroup's triangles). Uses the bbox center, matching
+ * the worker's getBoundingBox-center computation at resolve time.
+ */
+export function faceRefFromPoints(points: Float32Array | number[]): FaceRef {
+  return edgeRefFromPoints(points);
+}

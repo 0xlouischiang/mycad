@@ -8,10 +8,12 @@
 import type {
   CmdExport,
   CmdMakeBox,
+  CmdMassProps,
   CmdRegenerate,
   ExportResult,
   InitResult,
   KernelCommand,
+  MassPropsResult,
   RegenResult,
   RequestMessage,
   ResponseMessage,
@@ -21,7 +23,7 @@ import type {
 import type { FeatureTree } from "../model/featureTree";
 
 interface Pending {
-  resolve: (value: InitResult | ShapeResult | RegenResult | ExportResult) => void;
+  resolve: (value: InitResult | ShapeResult | RegenResult | ExportResult | MassPropsResult) => void;
   reject: (reason: Error) => void;
 }
 
@@ -68,7 +70,7 @@ export class KernelClient {
 
   private send(
     command: KernelCommand,
-  ): Promise<InitResult | ShapeResult | RegenResult | ExportResult> {
+  ): Promise<InitResult | ShapeResult | RegenResult | ExportResult | MassPropsResult> {
     const id = this.nextId++;
     const message: RequestMessage = { id, command };
     return new Promise((resolve, reject) => {
@@ -114,6 +116,13 @@ export class KernelClient {
     await this.init();
     const cmd: CmdExport = { op: "export", format, tree };
     return this.send(cmd) as Promise<ExportResult>;
+  }
+
+  /** Compute mass properties (volume, surface area, center of mass). */
+  async massProps(tree: FeatureTree): Promise<MassPropsResult> {
+    await this.init();
+    const cmd: CmdMassProps = { op: "massProps", tree };
+    return this.send(cmd) as Promise<MassPropsResult>;
   }
 
   dispose(): void {

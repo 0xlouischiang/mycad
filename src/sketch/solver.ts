@@ -265,6 +265,9 @@ function buildResiduals(
 ): ResidualFn[] {
   const fns: ResidualFn[] = [];
   const line = (id: string) => entityById.get(id) as LineEntity | undefined;
+  /** Center point id of a circle or arc entity, or undefined otherwise. */
+  const centerOf = (e: SketchEntity | undefined): string | undefined =>
+    e?.type === "circle" || e?.type === "arc" ? e.center : undefined;
 
   for (const c of sketch.constraints) {
     switch (c.type) {
@@ -372,6 +375,70 @@ function buildResiduals(
             return Math.sqrt(dx * dx + dy * dy) - c.value;
           });
         }
+        break;
+      }
+      case "concentric": {
+        // Center points of two circles/arcs coincide (2 residuals).
+        const ca = centerOf(entityById.get(c.a));
+        const cb = centerOf(entityById.get(c.b));
+        if (!ca || !cb) break;
+        fns.push((u) => u(ca) - u(cb));
+        fns.push((_, v) => v(ca) - v(cb));
+        break;
+      }
+      case "midpoint": {
+        const l = line(c.line);
+        if (!l) break;
+        // point == (p1 + p2) / 2  (2 residuals)
+        fns.push((u) => u(c.point) - (u(l.p1) + u(l.p2)) / 2);
+        fns.push((_, v) => v(c.point) - (v(l.p1) + v(l.p2)) / 2);
+        break;
+      }
+      case "symmetric": {
+        const l = line(c.line);
+        if (!l) break;
+        // p1 and p2 are mirror images across the infinite line through l.
+        // Residuals: (a) midpoint of p1p2 lies on the line; (b) p1p2 is
+        // perpendicular to the line direction.
+        fns.push((u, v) => {
+          const ax = u(l.p2) - u(l.p1);
+          const ay = v(l.p2) - v(l.p1);
+          const mx = (u(c.p1) + u(c.p2)) / 2 - u(l.p1);
+          const my = (v(c.p1) + v(c.p2)) / 2 - v(l.p1);
+          return ax * my - ay * mx; // cross == 0 => midpoint on line
+        });
+        fns.push((u, v) => {
+          const ax = u(l.p2) - u(l.p1);
+          const ay = v(l.p2) - v(l.p1);
+          const dx = u(c.p2) - u(c.p1);
+          const dy = v(c.p2) - v(c.p1);
+          return ax * dx + ay * dy; // dot == 0 => p1p2 ⟂ line
+        });
+        break;
+      }
+      case "tangent": {
+        const l = line(c.line);
+        const curve = entityById.get(c.curve);
+        const center = centerOf(curve);
+        if (!l || !curve || !center) break;
+        // Distance from the curve center to the infinite line == radius.
+        fns.push((u, v, r) => {
+          const ax = u(l.p2) - u(l.p1);
+          const ay = v(l.p2) - v(l.p1);
+          const len = Math.sqrt(ax * ax + ay * ay) || 1e-9;
+          // signed perpendicular distance center→line
+          const cx = u(center) - u(l.p1);
+          const cy = v(center) - v(l.p1);
+          const dist = (ax * cy - ay * cx) / len;
+          const radius =
+            curve.type === "circle"
+              ? r(curve.id)
+              : Math.sqrt(
+                  (u((curve as ArcEntity).start) - u(center)) ** 2 +
+                    (v((curve as ArcEntity).start) - v(center)) ** 2,
+                );
+          return Math.abs(dist) - radius;
+        });
         break;
       }
       default: {

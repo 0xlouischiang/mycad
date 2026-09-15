@@ -29,7 +29,8 @@ export interface Vec3 {
 
 /** A sketch plane: a 2D (u,v) frame embedded in 3D world space. */
 export interface SketchPlane {
-  id: SketchPlaneId;
+  /** Base-plane id, or "custom" for a face-derived plane. */
+  id: SketchPlaneId | "custom";
   /** World-space origin of the plane's (0,0). */
   origin: Vec3;
   /** World-space unit vector for the sketch's +u (2D x) axis. */
@@ -93,7 +94,7 @@ export interface SketchPoint {
   fixed: boolean;
 }
 
-export type EntityType = "line" | "circle" | "arc";
+export type EntityType = "line" | "circle" | "arc" | "ellipse" | "spline";
 
 export interface LineEntity {
   id: string;
@@ -111,6 +112,31 @@ export interface CircleEntity {
   radius: number;
 }
 
+/**
+ * An ellipse: closed curve about a center. `rotation` is the major-axis angle
+ * (radians) measured in-plane from the plane's +u axis. A lone ellipse forms a
+ * closed profile like a circle.
+ */
+export interface EllipseEntity {
+  id: string;
+  type: "ellipse";
+  center: string;
+  majorRadius: number;
+  minorRadius: number;
+  rotation: number;
+}
+
+/**
+ * A spline interpolating through an ordered list of points (>= 2). Its
+ * endpoints (first/last point) participate in profile chaining like a line's;
+ * interior points shape the curve. Built via the kernel's interpolatePoints.
+ */
+export interface SplineEntity {
+  id: string;
+  type: "spline";
+  points: string[];
+}
+
 export interface ArcEntity {
   id: string;
   type: "arc";
@@ -118,9 +144,20 @@ export interface ArcEntity {
   /** Start and end points; radius is implied by |center-start| and enforced. */
   start: string;
   end: string;
+  /**
+   * Sweep direction from start to end. "ccw" (default) sweeps counter-clockwise;
+   * "cw" sweeps clockwise. Needed to disambiguate which of the two arcs between
+   * start and end is meant (e.g. a slot end-cap must bulge outward, not inward).
+   */
+  sweep?: "ccw" | "cw";
 }
 
-export type SketchEntity = LineEntity | CircleEntity | ArcEntity;
+export type SketchEntity =
+  | LineEntity
+  | CircleEntity
+  | ArcEntity
+  | EllipseEntity
+  | SplineEntity;
 
 // ---------------------------------------------------------------------------
 // Constraints
@@ -135,7 +172,11 @@ export type ConstraintType =
   | "equalLength"
   | "distance"
   | "angle"
-  | "radius";
+  | "radius"
+  | "concentric"
+  | "midpoint"
+  | "symmetric"
+  | "tangent";
 
 /** Two points made to occupy the same location. */
 export interface CoincidentConstraint {
@@ -186,13 +227,50 @@ export interface RadiusConstraint {
   value: number;
 }
 
+/** Two circles/arcs share a center point (their center points coincide). */
+export interface ConcentricConstraint {
+  id: string;
+  type: "concentric";
+  a: string; // circle or arc entity id
+  b: string; // circle or arc entity id
+}
+
+/** A point pinned to the midpoint of a line. */
+export interface MidpointConstraint {
+  id: string;
+  type: "midpoint";
+  point: string; // point id
+  line: string; // line entity id
+}
+
+/** Two points made symmetric about a line (mirror line). */
+export interface SymmetricConstraint {
+  id: string;
+  type: "symmetric";
+  p1: string;
+  p2: string;
+  line: string; // mirror-line entity id
+}
+
+/** A line made tangent to a circle/arc (distance center→line == radius). */
+export interface TangentConstraint {
+  id: string;
+  type: "tangent";
+  line: string; // line entity id
+  curve: string; // circle or arc entity id
+}
+
 export type Constraint =
   | CoincidentConstraint
   | OrientConstraint
   | PairLineConstraint
   | DistanceConstraint
   | AngleConstraint
-  | RadiusConstraint;
+  | RadiusConstraint
+  | ConcentricConstraint
+  | MidpointConstraint
+  | SymmetricConstraint
+  | TangentConstraint;
 
 // ---------------------------------------------------------------------------
 // Sketch
@@ -201,14 +279,56 @@ export type Constraint =
 export interface Sketch {
   id: string;
   planeId: SketchPlaneId;
+  /**
+   * Offset of the sketch plane along the base plane's normal, in model units.
+   * 0 = the base plane itself. Lets sketches sit at arbitrary heights (a datum
+   * plane) — enables e.g. lofting two same-orientation profiles at different
+   * offsets, and sketching on top of a body.
+   */
+  planeOffset: number;
+  /**
+   * When the sketch is on a selected model face (not a base plane), the face's
+   * derived plane basis is stored here and takes precedence over planeId/offset.
+   * Serializable; computed on the main thread from the face's mesh triangles.
+   */
+  customPlane?: SketchPlane;
   points: SketchPoint[];
   entities: SketchEntity[];
   constraints: Constraint[];
 }
 
-/** Create an empty sketch on the given plane. */
-export function makeSketch(id: string, planeId: SketchPlaneId): Sketch {
-  return { id, planeId, points: [], entities: [], constraints: [] };
+/** Create an empty sketch on the given plane, optionally offset along normal. */
+export function makeSketch(
+  id: string,
+  planeId: SketchPlaneId,
+  planeOffset = 0,
+): Sketch {
+  return { id, planeId, planeOffset, points: [], entities: [], constraints: [] };
+}
+
+/**
+ * Resolve a sketch's effective plane: the base plane translated along its
+ * normal by the sketch's offset. All 2D→3D mapping (regen, picking) must use
+ * THIS, not BASE_PLANES directly, so offset sketches land at the right height.
+ */
+export function resolveSketchPlane(sketch: {
+  planeId: SketchPlaneId;
+  planeOffset?: number;
+  customPlane?: SketchPlane;
+}): SketchPlane {
+  // A face-derived custom plane takes precedence over the base plane + offset.
+  if (sketch.customPlane) return sketch.customPlane;
+  const base = BASE_PLANES[sketch.planeId];
+  const d = sketch.planeOffset ?? 0;
+  if (d === 0) return base;
+  return {
+    ...base,
+    origin: {
+      x: base.origin.x + base.normal.x * d,
+      y: base.origin.y + base.normal.y * d,
+      z: base.origin.z + base.normal.z * d,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

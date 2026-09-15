@@ -19,6 +19,10 @@ import { PlanePicker } from "./ui/PlanePicker";
 import { DocumentBar } from "./ui/DocumentBar";
 import { TabBar } from "./ui/TabBar";
 import { VersionPanel } from "./ui/VersionPanel";
+import { VariablesPanel } from "./ui/VariablesPanel";
+import { ConfigurationsPanel } from "./ui/ConfigurationsPanel";
+import { MassPropertiesPanel } from "./ui/MassPropertiesPanel";
+import { RobotView } from "./robot/RobotView";
 import { SketchCanvas } from "./sketch/SketchCanvas";
 import { SketchToolbar } from "./sketch/SketchToolbar";
 
@@ -28,6 +32,7 @@ export default function App() {
   const error = useStore((s) => s.error);
   const initKernel = useStore((s) => s.initKernel);
   const restoreLast = useStore((s) => s.restoreLast);
+  const activeRobotId = useStore((s) => s.activeRobotId);
   const inSketchMode = useSketchStore((s) => s.sketch !== null);
 
   useEffect(() => {
@@ -39,18 +44,43 @@ export default function App() {
   // model later). Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Ctrl+Y = redo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (inSketchMode) return;
-      // Ignore when typing in an input (e.g. the document name field).
+      // Ignore when typing in an input (e.g. name fields, dimension edits).
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
         return;
       }
+
+      // Sketch mode: single-key tool shortcuts (CAD convention).
+      if (inSketchMode) {
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        const sk = useSketchStore.getState();
+        const map: Record<string, Parameters<typeof sk.setTool>[0]> = {
+          v: "select",
+          l: "line",
+          r: "rectangle",
+          c: "circle",
+          a: "arc",
+          g: "polygon",
+          s: "slot",
+          e: "ellipse",
+          p: "spline",
+        };
+        const key = e.key.toLowerCase();
+        if (e.key === "Escape") {
+          sk.setTool("select");
+        } else if (map[key]) {
+          sk.setTool(map[key]);
+        }
+        return;
+      }
+
       const store = useStore.getState();
 
-      // Escape: exit read-only version view, else clear the 3D edge selection.
+      // Escape: exit read-only version view, else clear the 3D selection.
       if (e.key === "Escape") {
         if (store.viewingVersionId !== null) store.exitVersionView();
         else if (store.selectedEdgeRefs.length > 0) store.setSelectedEdges([]);
+        else if (store.selectedFaceRefs.length > 0) store.setSelectedFaces([]);
         return;
       }
 
@@ -93,6 +123,9 @@ export default function App() {
         <>
         <DocumentBar />
         <TabBar />
+        {activeRobotId !== null ? (
+          <RobotView />
+        ) : (
         <div className="flex min-h-0 flex-1">
           <aside className="flex w-80 flex-col border-r border-neutral-800 bg-neutral-900">
             <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
@@ -117,6 +150,9 @@ export default function App() {
               <FeatureTreePanel />
               <ParameterEditor />
               <PlanePicker />
+              <VariablesPanel />
+              <ConfigurationsPanel />
+              <MassPropertiesPanel />
               <VersionPanel />
             </div>
 
@@ -131,6 +167,7 @@ export default function App() {
             <ViewportView />
           </main>
         </div>
+        )}
         </>
       )}
     </div>

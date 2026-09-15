@@ -5,7 +5,7 @@
  * Persistence is auto-save (debounced in the store), so the indicator is
  * informational; the explicit actions are New, Open, and Export.
  */
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useStore } from "../store";
 import { listDocuments, type DocumentSummary } from "../persistence/db";
 
@@ -17,6 +17,8 @@ export function DocumentBar() {
   const newDoc = useStore((s) => s.newDoc);
   const loadDoc = useStore((s) => s.loadDoc);
   const exportModel = useStore((s) => s.exportModel);
+  const addImport = useStore((s) => s.addImport);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const undo = useStore((s) => s.undo);
   const redo = useStore((s) => s.redo);
   const canUndo = useStore((s) => s.canUndo);
@@ -109,6 +111,30 @@ export function DocumentBar() {
         </div>
 
         <div className="mx-1 h-5 w-px bg-neutral-700" />
+
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          title="Import a STEP or STL file as a body"
+          className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
+        >
+          Import
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".step,.stp,.stl"
+          className="hidden"
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = ""; // allow re-importing the same file
+            if (!file) return;
+            const text = await file.text();
+            const lower = file.name.toLowerCase();
+            const format = lower.endsWith(".stl") ? "stl" : "step";
+            addImport(format, text, file.name);
+          }}
+        />
 
         <button
           type="button"

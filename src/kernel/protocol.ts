@@ -95,8 +95,19 @@ export interface CmdExport {
   tree: FeatureTree;
 }
 
+/** Compute mass properties of the tree's regenerated solid. */
+export interface CmdMassProps {
+  op: "massProps";
+  tree: FeatureTree;
+}
+
 /** Union of all commands the worker understands. */
-export type KernelCommand = CmdInit | CmdMakeBox | CmdRegenerate | CmdExport;
+export type KernelCommand =
+  | CmdInit
+  | CmdMakeBox
+  | CmdRegenerate
+  | CmdExport
+  | CmdMassProps;
 
 export type KernelOp = KernelCommand["op"];
 
@@ -158,6 +169,13 @@ export interface ExportResult {
   data: string;
 }
 
+/** Mass properties of the current solid, or nulls if the model is empty. */
+export interface MassPropsResult {
+  volume: number | null;
+  surfaceArea: number | null;
+  centerOfMass: [number, number, number] | null;
+}
+
 export type ResultFor<C extends KernelCommand> = C extends CmdInit
   ? InitResult
   : C extends CmdMakeBox
@@ -166,12 +184,19 @@ export type ResultFor<C extends KernelCommand> = C extends CmdInit
       ? RegenResult
       : C extends CmdExport
         ? ExportResult
-        : never;
+        : C extends CmdMassProps
+          ? MassPropsResult
+          : never;
 
 export interface ResponseOk {
   id: number;
   ok: true;
-  result: InitResult | ShapeResult | RegenResult | ExportResult;
+  result:
+    | InitResult
+    | ShapeResult
+    | RegenResult
+    | ExportResult
+    | MassPropsResult;
 }
 
 export interface ResponseErr {
@@ -191,7 +216,12 @@ export type ResponseMessage = ResponseOk | ResponseErr;
  * ownership instead of copying. Safe to call on any result shape.
  */
 export function collectTransferables(
-  result: InitResult | ShapeResult | RegenResult | ExportResult,
+  result:
+    | InitResult
+    | ShapeResult
+    | RegenResult
+    | ExportResult
+    | MassPropsResult,
 ): Transferable[] {
   if (!("mesh" in result) || result.mesh == null) return [];
   const mesh = result.mesh;

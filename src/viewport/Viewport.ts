@@ -13,12 +13,35 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { ShapeResult } from "../kernel/protocol";
-import { edgeRefFromPoints, type EdgeRef } from "../model/edgeRef";
+import {
+  edgeRefFromPoints,
+  faceRefFromPoints,
+  type EdgeRef,
+  type FaceRef,
+} from "../model/edgeRef";
+
+/** What the pointer picks in the 3D view. */
+export type PickMode = "edge" | "face";
+
+/** Named standard camera orientations. */
+export type StandardView =
+  | "front"
+  | "back"
+  | "top"
+  | "bottom"
+  | "left"
+  | "right"
+  | "iso";
 
 /** Edge colors as [r,g,b] floats for vertex-color highlighting. */
 const EDGE_BASE: [number, number, number] = [0.04, 0.04, 0.04];
 const EDGE_HOVER: [number, number, number] = [1.0, 0.6, 0.1];
 const EDGE_SELECTED: [number, number, number] = [0.98, 0.8, 0.09];
+
+/** Face colors: the base blue tint, plus hover/selected highlights. */
+const FACE_BASE: [number, number, number] = [0.29, 0.56, 0.85];
+const FACE_HOVER: [number, number, number] = [0.45, 0.7, 0.95];
+const FACE_SELECTED: [number, number, number] = [0.96, 0.75, 0.2];
 
 export class Viewport {
   private renderer: THREE.WebGLRenderer;
@@ -27,6 +50,15 @@ export class Viewport {
   private controls: OrbitControls;
   private resizeObserver: ResizeObserver;
   private frame = 0;
+
+  /** Last shape bbox, so standard views can frame even between regens. */
+  private lastBbox: ShapeResult["bbox"] = {
+    min: [-20, -20, -20],
+    max: [20, 20, 20],
+  };
+
+  /** Section-view clipping plane, applied to the mesh material when active. */
+  private sectionPlane: THREE.Plane | null = null;
 
   // Reusable objects for the current shape. Created once, updated in place.
   private meshGeometry: THREE.BufferGeometry;
@@ -46,8 +78,22 @@ export class Viewport {
   private edgeColors: Float32Array = new Float32Array(0);
   private hoveredRef: EdgeRef | null = null;
   private selectedRefs: Set<EdgeRef> = new Set();
-  /** Callback invoked when the selection set changes via canvas interaction. */
+  /** Callback invoked when the edge selection set changes via interaction. */
   onSelectionChange: ((refs: EdgeRef[]) => void) | null = null;
+
+  // --- Face picking state ---
+  /** Current pick mode: edges (fillet/chamfer) or faces (shell/draft). */
+  private pickMode: PickMode = "edge";
+  /** Per-mesh-triangle face ref, indexed by triangle number. */
+  private triFaceRefs: FaceRef[] = [];
+  /** Distinct face refs currently rendered. */
+  private faceRefs: Set<FaceRef> = new Set();
+  /** Per-triangle-vertex base color buffer for face highlighting. */
+  private faceColors: Float32Array = new Float32Array(0);
+  private hoveredFace: FaceRef | null = null;
+  private selectedFaces: Set<FaceRef> = new Set();
+  /** Callback invoked when the face selection set changes via interaction. */
+  onFaceSelectionChange: ((refs: FaceRef[]) => void) | null = null;
 
   constructor(container: HTMLElement) {
     this.scene = new THREE.Scene();
@@ -60,6 +106,7 @@ export class Viewport {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(w, h);
+    this.renderer.localClippingEnabled = true; // for section-view clipping
     container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -82,7 +129,8 @@ export class Viewport {
     // Preallocate the shape's mesh + edge objects.
     this.meshGeometry = new THREE.BufferGeometry();
     const material = new THREE.MeshStandardMaterial({
-      color: 0x4a90d9,
+      color: 0xffffff, // base tint comes from per-vertex colors
+      vertexColors: true,
       metalness: 0.1,
       roughness: 0.6,
       side: THREE.DoubleSide,
@@ -126,9 +174,48 @@ export class Viewport {
       new THREE.BufferAttribute(mesh.normals, 3),
     );
     this.meshGeometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+
+    // Build the per-triangle face-ref map + per-vertex color buffer for face
+    // picking/highlighting. faceGroups are [indexStart, indexCount, faceHash]
+    // triples in INDEX units (see occt-wasm-group-units). Each group's face ref
+    // is the bbox center of its triangles' vertices (matches the worker's
+    // getBoundingBox-center at shell/draft resolve time).
+    this.faceColors = new Float32Array(mesh.positions.length);
+    this.triFaceRefs = new Array(mesh.triangleCount);
+    this.faceRefs = new Set();
+    const fg = mesh.faceGroups;
+    for (let g = 0; g < fg.length; g += 3) {
+      const indexStart = fg[g];
+      const indexCount = fg[g + 1];
+      // Collect this face's vertex positions to compute its bbox-center ref.
+      const coords: number[] = [];
+      for (let i = indexStart; i < indexStart + indexCount; i++) {
+        const v = mesh.indices[i] * 3;
+        coords.push(mesh.positions[v], mesh.positions[v + 1], mesh.positions[v + 2]);
+      }
+      const ref = faceRefFromPoints(coords);
+      this.faceRefs.add(ref);
+      // Record ref per triangle (indexCount/3 triangles, starting at
+      // indexStart/3).
+      const triStart = indexStart / 3;
+      for (let t = 0; t < indexCount / 3; t++) this.triFaceRefs[triStart + t] = ref;
+    }
+    this.meshGeometry.setAttribute(
+      "color",
+      new THREE.BufferAttribute(this.faceColors, 3),
+    );
     this.meshGeometry.attributes.position.needsUpdate = true;
     this.meshGeometry.computeBoundingSphere();
     this.mesh.visible = true;
+
+    // Drop face selections no longer present after regeneration.
+    for (const ref of [...this.selectedFaces]) {
+      if (!this.faceRefs.has(ref)) this.selectedFaces.delete(ref);
+    }
+    if (this.hoveredFace && !this.faceRefs.has(this.hoveredFace)) {
+      this.hoveredFace = null;
+    }
+    this.repaintFaces();
 
     // Edge overlay + picking metadata. `points` are XYZ samples, `edgeGroups`
     // are [floatStart, floatCount, hash] triples (float offsets — see
@@ -189,6 +276,30 @@ export class Viewport {
     if (attr) attr.needsUpdate = true;
   }
 
+  /** Recompute every mesh-triangle vertex color from face hover/selection. */
+  private repaintFaces(): void {
+    const colors = this.faceColors;
+    const indices = this.meshGeometry.getIndex();
+    if (!indices) return;
+    for (let tri = 0; tri < this.triFaceRefs.length; tri++) {
+      const ref = this.triFaceRefs[tri];
+      const c = this.selectedFaces.has(ref)
+        ? FACE_SELECTED
+        : ref === this.hoveredFace
+          ? FACE_HOVER
+          : FACE_BASE;
+      // Color all three vertices of this triangle.
+      for (let k = 0; k < 3; k++) {
+        const vi = indices.getX(tri * 3 + k) * 3;
+        colors[vi] = c[0];
+        colors[vi + 1] = c[1];
+        colors[vi + 2] = c[2];
+      }
+    }
+    const attr = this.meshGeometry.getAttribute("color");
+    if (attr) attr.needsUpdate = true;
+  }
+
   /** Explicitly refit the camera to the current shape (e.g. a "zoom to fit"). */
   frameCurrent(bbox: ShapeResult["bbox"]): void {
     this.frameShape(bbox);
@@ -201,7 +312,12 @@ export class Viewport {
   }
 
   /** Point the camera at the shape's bounding box and fit it in view. */
-  private frameShape(bbox: ShapeResult["bbox"]): void {
+  private frameShape(
+    bbox: ShapeResult["bbox"],
+    viewDir?: THREE.Vector3,
+    up?: THREE.Vector3,
+  ): void {
+    this.lastBbox = bbox;
     const min = new THREE.Vector3(...bbox.min);
     const max = new THREE.Vector3(...bbox.max);
     const center = min.clone().add(max).multiplyScalar(0.5);
@@ -209,13 +325,64 @@ export class Viewport {
     const radius = Math.max(size.x, size.y, size.z, 1) * 0.5;
 
     const dist = radius / Math.sin((this.camera.fov * Math.PI) / 360);
-    const dir = new THREE.Vector3(1, 0.8, 1).normalize();
+    const dir = (viewDir ?? new THREE.Vector3(1, 0.8, 1)).clone().normalize();
     this.camera.position.copy(center.clone().add(dir.multiplyScalar(dist * 1.4)));
+    if (up) this.camera.up.copy(up);
     this.camera.near = dist * 0.01;
     this.camera.far = dist * 100;
     this.camera.updateProjectionMatrix();
     this.controls.target.copy(center);
     this.controls.update();
+  }
+
+  /**
+   * Orient the camera to a named standard view, framed to the current shape.
+   * Directions are the vector FROM the model TO the camera in world space.
+   */
+  setView(name: StandardView): void {
+    const Z = new THREE.Vector3(0, 0, 1);
+    const Y = new THREE.Vector3(0, 1, 0);
+    const views: Record<
+      StandardView,
+      { dir: THREE.Vector3; up: THREE.Vector3 }
+    > = {
+      front: { dir: new THREE.Vector3(0, -1, 0), up: Z },
+      back: { dir: new THREE.Vector3(0, 1, 0), up: Z },
+      top: { dir: new THREE.Vector3(0, 0, 1), up: Y },
+      bottom: { dir: new THREE.Vector3(0, 0, -1), up: Y },
+      right: { dir: new THREE.Vector3(1, 0, 0), up: Z },
+      left: { dir: new THREE.Vector3(-1, 0, 0), up: Z },
+      iso: { dir: new THREE.Vector3(1, -1, 0.8), up: Z },
+    };
+    const v = views[name];
+    this.frameShape(this.lastBbox, v.dir, v.up);
+  }
+
+  /**
+   * Set (or clear) the section-view clipping plane. `axis` picks the plane
+   * normal (world X/Y/Z); `offset` slides it along that axis. Passing null
+   * clears the section. Geometry on the negative side of the plane is hidden,
+   * revealing the interior.
+   */
+  setSection(axis: "x" | "y" | "z" | null, offset = 0): void {
+    const mat = this.mesh.material as THREE.Material;
+    if (axis === null) {
+      this.sectionPlane = null;
+      mat.clippingPlanes = [];
+      mat.needsUpdate = true;
+      return;
+    }
+    const normal =
+      axis === "x"
+        ? new THREE.Vector3(-1, 0, 0)
+        : axis === "y"
+          ? new THREE.Vector3(0, -1, 0)
+          : new THREE.Vector3(0, 0, -1);
+    // Plane keeps the half-space where normal·point + constant >= 0. With a
+    // -axis normal, that's the side below `offset` along the axis.
+    this.sectionPlane = new THREE.Plane(normal, offset);
+    mat.clippingPlanes = [this.sectionPlane];
+    mat.needsUpdate = true;
   }
 
   private onResize(container: HTMLElement): void {
@@ -256,8 +423,38 @@ export class Viewport {
     return this.segmentRefs[seg] ?? null;
   }
 
-  /** Update hover highlight from NDC coords. Returns the hovered ref. */
-  hover(ndcX: number, ndcY: number): EdgeRef | null {
+  /** Switch what the pointer picks (edges for fillet/chamfer, faces for shell/draft). */
+  setPickMode(mode: PickMode): void {
+    if (mode === this.pickMode) return;
+    this.pickMode = mode;
+    // Clear the transient hover of the mode we're leaving.
+    this.hoveredRef = null;
+    this.hoveredFace = null;
+    this.repaintEdges();
+    this.repaintFaces();
+  }
+
+  /** Raycast the solid mesh and return the hit triangle's face ref, or null. */
+  private pickFace(ndcX: number, ndcY: number): FaceRef | null {
+    if (!this.mesh.visible) return null;
+    this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera);
+    const hits = this.raycaster.intersectObject(this.mesh, false);
+    if (hits.length === 0) return null;
+    const faceIndex = hits[0].faceIndex; // triangle number
+    if (faceIndex == null) return null;
+    return this.triFaceRefs[faceIndex] ?? null;
+  }
+
+  /** Update hover highlight from NDC coords. Returns the hovered ref (mode-dependent). */
+  hover(ndcX: number, ndcY: number): EdgeRef | FaceRef | null {
+    if (this.pickMode === "face") {
+      const ref = this.pickFace(ndcX, ndcY);
+      if (ref !== this.hoveredFace) {
+        this.hoveredFace = ref;
+        this.repaintFaces();
+      }
+      return ref;
+    }
     const ref = this.pickEdge(ndcX, ndcY);
     if (ref !== this.hoveredRef) {
       this.hoveredRef = ref;
@@ -267,11 +464,28 @@ export class Viewport {
   }
 
   /**
-   * Handle a pick click. If an edge is hit, toggle it in the selection
-   * (additive keeps existing selection; non-additive replaces). Returns true if
-   * an edge was hit (so the caller can suppress orbit/deselect behavior).
+   * Handle a pick click. Toggles the hit edge/face (per mode) in its selection
+   * set. Returns true if something was hit (so the caller can suppress orbit).
    */
   clickSelect(ndcX: number, ndcY: number, additive: boolean): boolean {
+    if (this.pickMode === "face") {
+      const ref = this.pickFace(ndcX, ndcY);
+      if (!ref) {
+        if (!additive && this.selectedFaces.size > 0) {
+          this.selectedFaces.clear();
+          this.repaintFaces();
+          this.onFaceSelectionChange?.([]);
+        }
+        return false;
+      }
+      if (!additive) this.selectedFaces.clear();
+      if (this.selectedFaces.has(ref)) this.selectedFaces.delete(ref);
+      else this.selectedFaces.add(ref);
+      this.repaintFaces();
+      this.onFaceSelectionChange?.([...this.selectedFaces]);
+      return true;
+    }
+
     const ref = this.pickEdge(ndcX, ndcY);
     if (!ref) {
       if (!additive && this.selectedRefs.size > 0) {
@@ -289,10 +503,16 @@ export class Viewport {
     return true;
   }
 
-  /** Replace the selection set programmatically (e.g. store-driven sync). */
+  /** Replace the edge selection set programmatically (store-driven sync). */
   setSelection(refs: EdgeRef[]): void {
     this.selectedRefs = new Set(refs.filter((r) => this.edgeRefs.has(r)));
     this.repaintEdges();
+  }
+
+  /** Replace the face selection set programmatically (store-driven sync). */
+  setFaceSelection(refs: FaceRef[]): void {
+    this.selectedFaces = new Set(refs.filter((r) => this.faceRefs.has(r)));
+    this.repaintFaces();
   }
 
   private emitSelection(): void {

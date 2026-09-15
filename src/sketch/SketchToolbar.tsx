@@ -14,8 +14,13 @@ import type { ConstraintType } from "../model/sketch";
 const TOOLS: { id: SketchTool; label: string; hint: string }[] = [
   { id: "select", label: "Select", hint: "Select / drag points (V)" },
   { id: "line", label: "Line", hint: "Click to chain line segments" },
+  { id: "rectangle", label: "Rect", hint: "Click two opposite corners" },
   { id: "circle", label: "Circle", hint: "Click center, then radius" },
   { id: "arc", label: "Arc", hint: "Click center, start, end" },
+  { id: "polygon", label: "Poly", hint: "Click center, then a vertex" },
+  { id: "slot", label: "Slot", hint: "Click end A, end B, then width" },
+  { id: "ellipse", label: "Ellipse", hint: "Click center, major axis, then minor" },
+  { id: "spline", label: "Spline", hint: "Click points; Finish to close" },
 ];
 
 const GEOMETRIC: { type: ConstraintType; label: string }[] = [
@@ -25,6 +30,10 @@ const GEOMETRIC: { type: ConstraintType; label: string }[] = [
   { type: "parallel", label: "Parallel" },
   { type: "perpendicular", label: "Perpendicular" },
   { type: "equalLength", label: "Equal" },
+  { type: "concentric", label: "Concentric" },
+  { type: "midpoint", label: "Midpoint" },
+  { type: "symmetric", label: "Symmetric" },
+  { type: "tangent", label: "Tangent" },
 ];
 
 const DIMENSIONAL: { type: ConstraintType; label: string; prompt: string }[] = [
@@ -36,9 +45,14 @@ const DIMENSIONAL: { type: ConstraintType; label: string; prompt: string }[] = [
 export function SketchToolbar() {
   const tool = useSketchStore((s) => s.tool);
   const setTool = useSketchStore((s) => s.setTool);
+  const polygonSides = useSketchStore((s) => s.polygonSides);
+  const setPolygonSides = useSketchStore((s) => s.setPolygonSides);
+  const finishSpline = useSketchStore((s) => s.finishSpline);
   const exitSketch = useSketchStore((s) => s.exitSketch);
   const finish = useSketchStore((s) => s.finish);
   const addConstraint = useSketchStore((s) => s.addConstraint);
+  const addSketchFillet = useSketchStore((s) => s.addSketchFillet);
+  const addSketchMirror = useSketchStore((s) => s.addSketchMirror);
   const deleteSelected = useSketchStore((s) => s.deleteSelected);
   const lastSolve = useSketchStore((s) => s.lastSolve);
   const planeId = useSketchStore((s) => s.sketch?.planeId);
@@ -93,7 +107,59 @@ export function SketchToolbar() {
             {t.label}
           </button>
         ))}
+        {tool === "polygon" && (
+          <label className="flex items-center gap-1 text-xs text-neutral-400">
+            sides
+            <input
+              type="number"
+              min={3}
+              value={polygonSides}
+              onChange={(e) => setPolygonSides(Number(e.target.value))}
+              className="w-12 rounded border border-neutral-700 bg-neutral-800 px-1 py-1 text-right text-neutral-100 outline-none focus:border-blue-500"
+            />
+          </label>
+        )}
+        {tool === "spline" && (
+          <button
+            type="button"
+            onClick={finishSpline}
+            className="rounded bg-green-700 px-2 py-1 text-xs text-white hover:bg-green-600"
+          >
+            Finish spline
+          </button>
+        )}
         <div className="mx-1 h-5 w-px bg-neutral-700" />
+        <button
+          type="button"
+          onClick={() => {
+            const raw = window.prompt("Fillet radius:");
+            if (raw === null) return;
+            const r = Number(raw);
+            if (!Number.isFinite(r)) {
+              setMessage("Invalid radius");
+              return;
+            }
+            setMessage(addSketchFillet(r) ?? "Filleted corner");
+          }}
+          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
+        >
+          Fillet…
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            // Convention: last-selected entity is the mirror line.
+            const sel = useSketchStore.getState().selectedEntities;
+            if (sel.length < 2) {
+              setMessage("Select entities + a mirror line (last)");
+              return;
+            }
+            setMessage(addSketchMirror(sel[sel.length - 1]) ?? "Mirrored");
+          }}
+          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
+        >
+          Mirror
+        </button>
         <button
           type="button"
           onClick={deleteSelected}

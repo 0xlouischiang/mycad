@@ -16,7 +16,14 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSketchStore } from "./sketchStore";
-import type { ArcEntity, CircleEntity, LineEntity, Sketch } from "../model/sketch";
+import type {
+  ArcEntity,
+  CircleEntity,
+  EllipseEntity,
+  LineEntity,
+  Sketch,
+  SplineEntity,
+} from "../model/sketch";
 
 interface View {
   scale: number; // pixels per plane unit
@@ -165,23 +172,27 @@ export function SketchCanvas() {
   if (!sketch) return null;
 
   return (
-    <svg
-      ref={svgRef}
-      className="h-full w-full cursor-crosshair select-none bg-neutral-900"
-      onMouseDown={onMouseDown}
-      onWheel={onWheel}
-    >
-      <Grid size={size} view={view} toScreen={toScreen} />
-      <SketchGeometry
-        sketch={sketch}
-        toScreen={toScreen}
-        selectedPoints={selectedPoints}
-        selectedEntities={selectedEntities}
-        onEntityClick={(id, additive) => {
-          if (tool === "select") selectEntity(id, additive);
-        }}
-      />
-    </svg>
+    <div className="relative h-full w-full">
+      <svg
+        ref={svgRef}
+        className="h-full w-full cursor-crosshair select-none bg-neutral-900"
+        onMouseDown={onMouseDown}
+        onWheel={onWheel}
+      >
+        <Grid size={size} view={view} toScreen={toScreen} />
+        <SketchGeometry
+          sketch={sketch}
+          toScreen={toScreen}
+          selectedPoints={selectedPoints}
+          selectedEntities={selectedEntities}
+          onEntityClick={(id, additive) => {
+            if (tool === "select") selectEntity(id, additive);
+          }}
+        />
+      </svg>
+      {/* Dimension annotations as HTML overlays (editable inline). */}
+      <DimensionLabels sketch={sketch} toScreen={toScreen} />
+    </div>
   );
 }
 
@@ -323,6 +334,61 @@ function SketchGeometry({
           );
         }
 
+        if (e.type === "ellipse") {
+          const el = e as EllipseEntity;
+          const center = pt(el.center);
+          if (!center) return null;
+          const [cx, cy] = toScreen(center.u, center.v);
+          const [mx] = toScreen(center.u + el.majorRadius, center.v);
+          const scale = Math.abs(mx - cx) / (el.majorRadius || 1);
+          const rx = el.majorRadius * scale;
+          const ry = el.minorRadius * scale;
+          // SVG rotates clockwise in screen space; plane +rotation is CCW and y
+          // is flipped, so negate to degrees.
+          const deg = (-el.rotation * 180) / Math.PI;
+          return (
+            <ellipse
+              key={e.id}
+              cx={cx}
+              cy={cy}
+              rx={rx}
+              ry={ry}
+              transform={`rotate(${deg} ${cx} ${cy})`}
+              fill="none"
+              stroke={stroke}
+              strokeWidth={sw}
+              className="cursor-pointer"
+              onMouseDown={onClick}
+            />
+          );
+        }
+
+        if (e.type === "spline") {
+          const sp = e as SplineEntity;
+          const scr = sp.points.map((id) => {
+            const p = pt(id);
+            return p ? toScreen(p.u, p.v) : null;
+          });
+          if (scr.some((s) => s === null) || scr.length < 2) return null;
+          // Smooth Catmull-Rom-ish preview via a simple polyline (the true
+          // curve is the kernel's interpolation; the polyline is a faithful
+          // enough 2D preview and keeps picking simple).
+          const d =
+            `M ${scr[0]![0]} ${scr[0]![1]} ` +
+            scr.slice(1).map((s) => `L ${s![0]} ${s![1]}`).join(" ");
+          return (
+            <path
+              key={e.id}
+              d={d}
+              fill="none"
+              stroke={stroke}
+              strokeWidth={sw}
+              className="cursor-pointer"
+              onMouseDown={onClick}
+            />
+          );
+        }
+
         // Arc
         const a = e as ArcEntity;
         const center = pt(a.center);
@@ -335,6 +401,7 @@ function SketchGeometry({
             center={center}
             start={start}
             end={end}
+            ccw={(a.sweep ?? "ccw") === "ccw"}
             toScreen={toScreen}
             stroke={stroke}
             strokeWidth={sw}
@@ -367,6 +434,7 @@ function ArcPath({
   center,
   start,
   end,
+  ccw,
   toScreen,
   stroke,
   strokeWidth,
@@ -375,6 +443,8 @@ function ArcPath({
   center: { u: number; v: number };
   start: { u: number; v: number };
   end: { u: number; v: number };
+  /** Plane-space sweep from start→end: CCW (default) or CW. */
+  ccw: boolean;
   toScreen: (u: number, v: number) => [number, number];
   stroke: string;
   strokeWidth: number;
@@ -387,14 +457,19 @@ function ArcPath({
   const [rx] = toScreen(center.u + r, center.v);
   const rPx = Math.abs(rx - cx0);
 
-  // Determine sweep direction (CCW in plane => CW on flipped screen).
+  // Signed plane-space sweep angle in the chosen direction determines largeArc.
   const a0 = Math.atan2(start.v - center.v, start.u - center.u);
   const a1 = Math.atan2(end.v - center.v, end.u - center.u);
   let delta = a1 - a0;
-  while (delta <= 0) delta += 2 * Math.PI;
-  const largeArc = delta > Math.PI ? 1 : 0;
-  // Plane CCW maps to screen CW because y is flipped => sweep-flag 0.
-  const sweep = 0;
+  if (ccw) {
+    while (delta <= 0) delta += 2 * Math.PI;
+  } else {
+    while (delta >= 0) delta -= 2 * Math.PI;
+  }
+  const largeArc = Math.abs(delta) > Math.PI ? 1 : 0;
+  // SVG y is flipped vs plane, so plane-CCW renders as screen sweep-flag 0 and
+  // plane-CW as sweep-flag 1.
+  const sweep = ccw ? 0 : 1;
 
   const d = `M ${sx} ${sy} A ${rPx} ${rPx} 0 ${largeArc} ${sweep} ${ex} ${ey}`;
   return (
@@ -406,5 +481,99 @@ function ArcPath({
       className="cursor-pointer"
       onMouseDown={onMouseDown}
     />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dimension annotations (HTML overlay, editable inline)
+// ---------------------------------------------------------------------------
+
+interface DimLabel {
+  id: string;
+  x: number; // screen px
+  y: number;
+  value: number;
+  suffix: string; // "" for distance/radius, "°" for angle
+  prefix: string; // "R" for radius, "" otherwise
+}
+
+function DimensionLabels({
+  sketch,
+  toScreen,
+}: {
+  sketch: Sketch;
+  toScreen: (u: number, v: number) => [number, number];
+}) {
+  const updateConstraintValue = useSketchStore((s) => s.updateConstraintValue);
+  const [editing, setEditing] = useState<string | null>(null);
+
+  const pt = (id: string) => sketch.points.find((p) => p.id === id);
+  const ent = (id: string) => sketch.entities.find((e) => e.id === id);
+
+  const labels: DimLabel[] = [];
+  for (const c of sketch.constraints) {
+    if (c.type === "distance") {
+      const a = pt(c.p1);
+      const b = pt(c.p2);
+      if (!a || !b) continue;
+      const [x, y] = toScreen((a.u + b.u) / 2, (a.v + b.v) / 2);
+      labels.push({ id: c.id, x, y, value: c.value, suffix: "", prefix: "" });
+    } else if (c.type === "angle") {
+      const la = ent(c.a);
+      if (!la || la.type !== "line") continue;
+      const p1 = pt(la.p1);
+      const p2 = pt(la.p2);
+      if (!p1 || !p2) continue;
+      const [x, y] = toScreen((p1.u + p2.u) / 2, (p1.v + p2.v) / 2);
+      labels.push({ id: c.id, x, y, value: c.value, suffix: "°", prefix: "" });
+    } else if (c.type === "radius") {
+      const e = ent(c.entity);
+      if (!e || (e.type !== "circle" && e.type !== "arc")) continue;
+      const center = pt(e.center);
+      if (!center) continue;
+      const [x, y] = toScreen(center.u, center.v);
+      labels.push({ id: c.id, x, y, value: c.value, suffix: "", prefix: "R" });
+    }
+  }
+
+  return (
+    <>
+      {labels.map((l) => (
+        <div
+          key={l.id}
+          style={{ left: l.x, top: l.y }}
+          className="absolute -translate-x-1/2 -translate-y-1/2"
+        >
+          {editing === l.id ? (
+            <input
+              autoFocus
+              type="number"
+              step="any"
+              defaultValue={l.value}
+              onBlur={(e) => {
+                updateConstraintValue(l.id, Number(e.target.value));
+                setEditing(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setEditing(null);
+              }}
+              className="w-16 rounded border border-blue-500 bg-neutral-900 px-1 text-center text-[11px] text-neutral-100 outline-none"
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setEditing(l.id)}
+              className="rounded bg-neutral-800/90 px-1 text-[11px] text-amber-300 hover:bg-neutral-700"
+              title="Edit dimension"
+            >
+              {l.prefix}
+              {Math.round(l.value * 1000) / 1000}
+              {l.suffix}
+            </button>
+          )}
+        </div>
+      ))}
+    </>
   );
 }
