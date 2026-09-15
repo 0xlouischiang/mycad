@@ -31,7 +31,7 @@ import {
   type Feature,
   type FeatureTree,
 } from "./model/featureTree";
-import type { Sketch } from "./model/sketch";
+import { makeSketch, newSketchId, type Sketch } from "./model/sketch";
 import type { EdgeRef, FaceRef } from "./model/edgeRef";
 import {
   activeConfigOverrides,
@@ -66,7 +66,20 @@ import { saveDocument, loadDocument, listDocuments } from "./persistence/db";
  */
 type RenderableShape = Pick<ShapeResult, "shapeId" | "mesh" | "edges" | "bbox">;
 
-interface AppState {
+/**
+ * A parametric primitive sketch spec for the chat command path. `cx`/`cy` are
+ * the shape center in plane (u,v) coordinates (default 0,0).
+ */
+export type PrimitiveSketchSpec = {
+  plane: "XY" | "XZ" | "YZ";
+  offset?: number;
+} & (
+  | { kind: "rectangle"; width: number; height: number; cx?: number; cy?: number }
+  | { kind: "circle"; radius: number; cx?: number; cy?: number }
+  | { kind: "polygon"; sides: number; radius: number; cx?: number; cy?: number }
+);
+
+export interface AppState {
   client: KernelClient;
   ready: boolean;
   busy: boolean;
@@ -171,6 +184,27 @@ interface AppState {
   /** Create a shell/draft from the current face selection. */
   addShell: () => void;
   addDraft: () => void;
+  /**
+   * Ref-accepting command variants. The UI button actions above delegate to
+   * these with the current viewport selection; the command registry (chat /
+   * LLM path) calls them directly with refs it derived from the geometry
+   * catalog. Both paths converge here → mutateTree → same undo/regen/save.
+   * Each returns the created feature id (or null if refs were empty).
+   */
+  addFilletFor: (edgeRefs: EdgeRef[], radius?: number) => string | null;
+  addChamferFor: (edgeRefs: EdgeRef[], distance?: number) => string | null;
+  addShellFor: (faceRefs: FaceRef[], thickness?: number) => string | null;
+  addDraftFor: (
+    faceRefs: FaceRef[],
+    direction?: "x" | "y" | "z",
+    angle?: number,
+  ) => string | null;
+  /**
+   * Build a parametric primitive sketch (rectangle / circle / polygon) and add
+   * it as a SketchFeature. Used by the chat command path (freeform NL sketching
+   * is out of scope); returns the created sketch feature id.
+   */
+  addSketchPrimitive: (spec: PrimitiveSketchSpec) => string;
   /** Add a hole feature (cuts the running body). */
   addHole: () => void;
   /** Add a split feature (cuts the body by a plane, keeps one side). */
@@ -722,6 +756,11 @@ export const useStore = create<AppState>((set, get) => {
       set({ selectedId: featureId });
     },
 
+    addSketchPrimitive: (spec) => {
+      const sketch = buildPrimitiveSketch(spec);
+      return get().addSketchFeature(sketch);
+    },
+
     addExtrude: (sketchId) => {
       const { tree } = get();
       // If a solid body already exists, default to "add"; else "new".
@@ -783,21 +822,36 @@ export const useStore = create<AppState>((set, get) => {
     setSelectedFaces: (refs) => set({ selectedFaceRefs: refs }),
 
     addShell: () => {
-      const { tree, selectedFaceRefs } = get();
-      if (selectedFaceRefs.length === 0) return;
-      const index = tree.features.filter((f) => f.type === "shell").length + 1;
-      const feature = makeShellFeature(selectedFaceRefs, index);
-      mutateTree([...tree.features, feature]);
-      set({ selectedId: feature.id, selectedFaceRefs: [] });
+      const id = get().addShellFor(get().selectedFaceRefs);
+      if (id) set({ selectedFaceRefs: [] });
     },
 
     addDraft: () => {
-      const { tree, selectedFaceRefs } = get();
-      if (selectedFaceRefs.length === 0) return;
-      const index = tree.features.filter((f) => f.type === "draft").length + 1;
-      const feature = makeDraftFeature(selectedFaceRefs, index);
+      const id = get().addDraftFor(get().selectedFaceRefs);
+      if (id) set({ selectedFaceRefs: [] });
+    },
+
+    addShellFor: (faceRefs, thickness) => {
+      if (faceRefs.length === 0) return null;
+      const { tree } = get();
+      const index = tree.features.filter((f) => f.type === "shell").length + 1;
+      const feature = makeShellFeature(faceRefs, index);
+      if (thickness !== undefined) feature.params.thickness = thickness;
       mutateTree([...tree.features, feature]);
-      set({ selectedId: feature.id, selectedFaceRefs: [] });
+      set({ selectedId: feature.id });
+      return feature.id;
+    },
+
+    addDraftFor: (faceRefs, direction, angle) => {
+      if (faceRefs.length === 0) return null;
+      const { tree } = get();
+      const index = tree.features.filter((f) => f.type === "draft").length + 1;
+      const feature = makeDraftFeature(faceRefs, index);
+      if (direction !== undefined) feature.params.direction = direction;
+      if (angle !== undefined) feature.params.angle = angle;
+      mutateTree([...tree.features, feature]);
+      set({ selectedId: feature.id });
+      return feature.id;
     },
 
     addHole: () => {
@@ -827,22 +881,36 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     addFillet: () => {
-      const { tree, selectedEdgeRefs } = get();
-      if (selectedEdgeRefs.length === 0) return;
-      const index = tree.features.filter((f) => f.type === "fillet").length + 1;
-      const feature = makeFilletFeature(selectedEdgeRefs, index);
-      mutateTree([...tree.features, feature]);
       // Clear the edge selection now that it's captured in the feature.
-      set({ selectedId: feature.id, selectedEdgeRefs: [] });
+      const id = get().addFilletFor(get().selectedEdgeRefs);
+      if (id) set({ selectedEdgeRefs: [] });
     },
 
     addChamfer: () => {
-      const { tree, selectedEdgeRefs } = get();
-      if (selectedEdgeRefs.length === 0) return;
-      const index = tree.features.filter((f) => f.type === "chamfer").length + 1;
-      const feature = makeChamferFeature(selectedEdgeRefs, index);
+      const id = get().addChamferFor(get().selectedEdgeRefs);
+      if (id) set({ selectedEdgeRefs: [] });
+    },
+
+    addFilletFor: (edgeRefs, radius) => {
+      if (edgeRefs.length === 0) return null;
+      const { tree } = get();
+      const index = tree.features.filter((f) => f.type === "fillet").length + 1;
+      const feature = makeFilletFeature(edgeRefs, index);
+      if (radius !== undefined) feature.params.radius = radius;
       mutateTree([...tree.features, feature]);
-      set({ selectedId: feature.id, selectedEdgeRefs: [] });
+      set({ selectedId: feature.id });
+      return feature.id;
+    },
+
+    addChamferFor: (edgeRefs, distance) => {
+      if (edgeRefs.length === 0) return null;
+      const { tree } = get();
+      const index = tree.features.filter((f) => f.type === "chamfer").length + 1;
+      const feature = makeChamferFeature(edgeRefs, index);
+      if (distance !== undefined) feature.params.distance = distance;
+      mutateTree([...tree.features, feature]);
+      set({ selectedId: feature.id });
+      return feature.id;
     },
 
     addMirror: () => {
@@ -1330,6 +1398,66 @@ export const useStore = create<AppState>((set, get) => {
 function sanitizeFilename(name: string): string {
   const cleaned = name.replace(/[^\w.\- ]+/g, "_").trim();
   return cleaned.length > 0 ? cleaned : "model";
+}
+
+/**
+ * Build a parametric primitive Sketch (rectangle / circle / polygon) from a
+ * PrimitiveSketchSpec. Mirrors the geometry the interactive sketch tools emit
+ * (see src/sketch/sketchStore.ts) but with fully-specified numeric coordinates
+ * — used by the chat command path, which can't click points. The result is a
+ * closed profile ready for extrude/revolve.
+ */
+function buildPrimitiveSketch(spec: PrimitiveSketchSpec): Sketch {
+  const sketch = makeSketch(newSketchId("sk"), spec.plane, spec.offset ?? 0);
+  const cx = spec.cx ?? 0;
+  const cy = spec.cy ?? 0;
+  const addPt = (u: number, v: number): string => {
+    const id = newSketchId("pt");
+    sketch.points.push({ id, u, v, fixed: false });
+    return id;
+  };
+
+  if (spec.kind === "circle") {
+    const center = addPt(cx, cy);
+    sketch.entities.push({
+      id: newSketchId("ci"),
+      type: "circle",
+      center,
+      radius: spec.radius,
+    });
+    return sketch;
+  }
+
+  // Rectangle and polygon both emit N corner points joined by a closed line
+  // loop (the profile extractor closes start→end).
+  let corners: string[];
+  if (spec.kind === "rectangle") {
+    const hw = spec.width / 2;
+    const hh = spec.height / 2;
+    corners = [
+      addPt(cx - hw, cy - hh),
+      addPt(cx + hw, cy - hh),
+      addPt(cx + hw, cy + hh),
+      addPt(cx - hw, cy + hh),
+    ];
+  } else {
+    const n = Math.max(3, Math.round(spec.sides));
+    corners = [];
+    for (let i = 0; i < n; i++) {
+      // Start at +v (top) so a hexagon reads flat-ish; any a0 gives a valid loop.
+      const a = Math.PI / 2 + (2 * Math.PI * i) / n;
+      corners.push(addPt(cx + spec.radius * Math.cos(a), cy + spec.radius * Math.sin(a)));
+    }
+  }
+  for (let i = 0; i < corners.length; i++) {
+    sketch.entities.push({
+      id: newSketchId("ln"),
+      type: "line",
+      p1: corners[i],
+      p2: corners[(i + 1) % corners.length],
+    });
+  }
+  return sketch;
 }
 
 /** Trigger a browser download of text content as a file. */

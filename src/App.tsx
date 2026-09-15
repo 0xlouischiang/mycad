@@ -22,6 +22,7 @@ import { VersionPanel } from "./ui/VersionPanel";
 import { VariablesPanel } from "./ui/VariablesPanel";
 import { ConfigurationsPanel } from "./ui/ConfigurationsPanel";
 import { MassPropertiesPanel } from "./ui/MassPropertiesPanel";
+import { ChatPanel } from "./ui/ChatPanel";
 import { RobotView } from "./robot/RobotView";
 import { SketchCanvas } from "./sketch/SketchCanvas";
 import { SketchToolbar } from "./sketch/SketchToolbar";
@@ -149,6 +150,7 @@ export default function App() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               <FeatureTreePanel />
               <ParameterEditor />
+              <ChatPanel />
               <PlanePicker />
               <VariablesPanel />
               <ConfigurationsPanel />

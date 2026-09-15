@@ -12,7 +12,10 @@
     "test:profile": "node --experimental-strip-types src/sketch/profile.test.ts",
     "test:regen": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/kernel/regen.test.ts",
     "test:robot": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/model/robot.test.ts",
-    "test": "npm run test:solver && npm run test:profile && npm run test:regen && npm run test:robot"
+    "test:commands": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/commands/registry.test.ts",
+    "test:chat": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/commands/chatController.test.ts",
+    "test:proxy": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs api/chat.test.ts",
+    "test": "npm run test:solver && npm run test:profile && npm run test:regen && npm run test:robot && npm run test:commands && npm run test:chat && npm run test:proxy"
   },
   "dependencies": {
     "occt-wasm": "^4.4.0",
