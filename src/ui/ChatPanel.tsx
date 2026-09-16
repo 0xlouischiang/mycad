@@ -18,6 +18,7 @@ import {
   type ChatMessage,
   type ChatEvent,
   type Transport,
+  type LoopConfig,
 } from "../commands/chatController";
 
 /** A line rendered in the transcript. */
@@ -26,7 +27,16 @@ interface Line {
   text: string;
 }
 
-export function ChatPanel({ transport = httpTransport }: { transport?: Transport }) {
+export function ChatPanel({
+  transport = httpTransport,
+  config,
+  placeholder = "Describe a change…",
+}: {
+  transport?: Transport;
+  /** Domain loop config; defaults to mechanical (Part Studio) inside runTurn. */
+  config?: LoopConfig;
+  placeholder?: string;
+}) {
   const [lines, setLines] = useState<Line[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -84,6 +94,7 @@ export function ChatPanel({ transport = httpTransport }: { transport?: Transport
         transport,
         store: useStore,
         emit: onEvent,
+        config,
       });
       messagesRef.current = result.messages;
       if (result.status === "clarify") setAwaitingClarify(true);
@@ -155,7 +166,7 @@ export function ChatPanel({ transport = httpTransport }: { transport?: Transport
           onKeyDown={(e) => {
             if (e.key === "Enter") void send();
           }}
-          placeholder={awaitingClarify ? "Answer the question…" : "Describe a change…"}
+          placeholder={awaitingClarify ? "Answer the question…" : placeholder}
           disabled={busy}
           className="min-w-0 flex-1 rounded border border-neutral-700 bg-neutral-800 px-2 py-1.5 text-xs text-neutral-100 outline-none focus:border-blue-500 disabled:opacity-50"
         />

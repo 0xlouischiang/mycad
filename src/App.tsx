@@ -24,6 +24,7 @@ import { ConfigurationsPanel } from "./ui/ConfigurationsPanel";
 import { MassPropertiesPanel } from "./ui/MassPropertiesPanel";
 import { ChatPanel } from "./ui/ChatPanel";
 import { RobotView } from "./robot/RobotView";
+import { BIMView } from "./bim/BIMView";
 import { SketchCanvas } from "./sketch/SketchCanvas";
 import { SketchToolbar } from "./sketch/SketchToolbar";
 
@@ -34,6 +35,7 @@ export default function App() {
   const initKernel = useStore((s) => s.initKernel);
   const restoreLast = useStore((s) => s.restoreLast);
   const activeRobotId = useStore((s) => s.activeRobotId);
+  const activeBimId = useStore((s) => s.activeBimId);
   const inSketchMode = useSketchStore((s) => s.sketch !== null);
 
   useEffect(() => {
@@ -124,7 +126,9 @@ export default function App() {
         <>
         <DocumentBar />
         <TabBar />
-        {activeRobotId !== null ? (
+        {activeBimId !== null ? (
+          <BIMView />
+        ) : activeRobotId !== null ? (
           <RobotView />
         ) : (
         <div className="flex min-h-0 flex-1">

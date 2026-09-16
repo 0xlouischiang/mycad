@@ -20,6 +20,7 @@ import { newFeatureId } from "./featureTree";
 import { emptyHistory, type VersionHistory } from "./version";
 import { evalExpr, type VarScope } from "./expr";
 import type { RobotTab } from "./robot";
+import type { BIMTab } from "./bim";
 
 /**
  * A named variable local to a Part Studio. `expression` is an expr.ts string
@@ -77,10 +78,18 @@ export interface CADDocument {
    * `tabs` so the Part Studio code path is untouched.
    */
   robots: RobotTab[];
+  /**
+   * BIM tabs (Phase 14) — an additive building-modeling layer, kept as a
+   * separate list for the same reason as `robots`: the Part Studio path is
+   * untouched.
+   */
+  bims: BIMTab[];
   /** Id of the currently active tab. Always references a tab in `tabs`. */
   activeTabId: string;
   /** Active robot tab id when a robot tab is focused, else null. */
   activeRobotId: string | null;
+  /** Active BIM tab id when a BIM tab is focused, else null. */
+  activeBimId: string | null;
   /** Bumped when the persisted shape changes, for migration. */
   schemaVersion: number;
 }
@@ -109,8 +118,10 @@ export function makeDocument(name = "Untitled"): CADDocument {
     name,
     tabs: [tab],
     robots: [],
+    bims: [],
     activeTabId: tab.id,
     activeRobotId: null,
+    activeBimId: null,
     schemaVersion: DOCUMENT_SCHEMA_VERSION,
   };
 }
@@ -143,6 +154,8 @@ export function migrateToDocument(raw: unknown): CADDocument {
       tabs,
       robots: (r.robots as RobotTab[] | undefined) ?? [],
       activeRobotId: (r.activeRobotId as string | null | undefined) ?? null,
+      bims: (r.bims as BIMTab[] | undefined) ?? [],
+      activeBimId: (r.activeBimId as string | null | undefined) ?? null,
     };
   }
   // v1 single-tree document → wrap in one Part Studio.
@@ -162,8 +175,10 @@ export function migrateToDocument(raw: unknown): CADDocument {
     name: (r?.name as string) ?? "Untitled",
     tabs: [tab],
     robots: [],
+    bims: [],
     activeTabId: tab.id,
     activeRobotId: null,
+    activeBimId: null,
     schemaVersion: DOCUMENT_SCHEMA_VERSION,
   };
 }

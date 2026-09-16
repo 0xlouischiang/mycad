@@ -16,7 +16,7 @@
  * The transport is injectable so the loop is unit-testable with canned
  * assistant messages (no network / API key needed).
  */
-import { dispatch, toolDefinitions, type StoreHandle } from "./registry";
+import { dispatch, toolDefinitions, type StoreHandle, type CommandResult } from "./registry";
 import { summarizeTree, catalogGeometry } from "./context";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +89,23 @@ Rules:
 - When a tool call returns an error, read it and retry with corrected parameters.
 - Keep any text brief; the user sees the features appear in the tree as you create them.`;
 
+/**
+ * Everything domain-specific about a chat loop. The loop control flow (execute
+ * tool_use in order, feed results back, clarify pause, retry cap, done) is
+ * identical for mechanical and BIM modeling; only these four bindings differ.
+ * Phase 16 passes a BIM config; the default is the mechanical (Phase 13) one.
+ */
+export interface LoopConfig {
+  /** System prompt describing the domain + rules. */
+  system: string;
+  /** Anthropic tool definitions (registry schemas + clarify). */
+  tools: unknown[];
+  /** Validate + run one tool call against the store. */
+  dispatch: (name: string, input: unknown, store: StoreHandle) => CommandResult;
+  /** Build the per-turn state block appended so the model sees current state. */
+  buildStateBlock: (store: StoreHandle) => string;
+}
+
 /** Build the per-turn state block appended so the model sees current geometry. */
 export function buildStateBlock(store: StoreHandle): string {
   const s = store.getState();
@@ -129,6 +146,14 @@ function round(n: number): number {
   return Math.round(n * 1000) / 1000;
 }
 
+/** The default (mechanical / Part Studio) loop config — Phase 13 behavior. */
+export const mechanicalLoopConfig: LoopConfig = {
+  system: SYSTEM,
+  tools: toolDefinitions(),
+  dispatch,
+  buildStateBlock,
+};
+
 /**
  * Run one user turn through the agentic loop. `messages` is the running
  * conversation (mutated: the assistant + tool_result messages are appended, so
@@ -144,15 +169,18 @@ export async function runTurn(
     transport: Transport;
     store: StoreHandle;
     emit: (e: ChatEvent) => void;
+    /** Domain bindings; defaults to the mechanical (Part Studio) config. */
+    config?: LoopConfig;
   },
 ): Promise<{ status: "done" | "clarify" | "error"; messages: ChatMessage[] }> {
   const { transport, store, emit } = opts;
+  const config = opts.config ?? mechanicalLoopConfig;
   const messages = opts.messages;
 
   // Append the user's instruction with the current state block attached.
   messages.push({
     role: "user",
-    content: `${opts.userText}\n\n---\n${buildStateBlock(store)}`,
+    content: `${opts.userText}\n\n---\n${config.buildStateBlock(store)}`,
   });
 
   let retries = 0;
@@ -160,9 +188,9 @@ export async function runTurn(
     let res: AssistantResponse;
     try {
       res = await transport({
-        system: SYSTEM,
+        system: config.system,
         messages,
-        tools: toolDefinitions(),
+        tools: config.tools,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -225,7 +253,7 @@ export async function runTurn(
     const results: ToolResultBlock[] = [];
     let hadError = false;
     for (const tu of toolUses) {
-      const result = dispatch(tu.name, tu.input, store);
+      const result = config.dispatch(tu.name, tu.input, store);
       if (result.ok) {
         emit({ kind: "tool_ok", command: tu.name, message: result.message });
         results.push({
@@ -251,7 +279,7 @@ export async function runTurn(
       role: "user",
       content: [
         ...results,
-        { type: "text", text: `---\n${buildStateBlock(store)}` },
+        { type: "text", text: `---\n${config.buildStateBlock(store)}` },
       ],
     });
 

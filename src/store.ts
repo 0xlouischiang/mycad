@@ -53,6 +53,22 @@ import {
 } from "./model/robot";
 import { exportUrdf, exportXacro, urdfName } from "./model/urdf";
 import {
+  makeBIMTab,
+  makeLevel,
+  makeGridLine,
+  type BIMTab,
+  type BuildingComponent,
+} from "./model/bim";
+import {
+  wallMesh,
+  slabMesh,
+  columnMesh,
+  beamMesh,
+  type BimMesh,
+} from "./bim/geometry";
+import { planWallCut, transformMesh, type Opening } from "./bim/wallCut";
+import { reconcileBim } from "./bim/cascade";
+import {
   nextVersionName,
   type VersionHistory,
   type VersionNode,
@@ -160,6 +176,47 @@ export interface AppState {
   computeRobotMeshes: () => Promise<void>;
   /** Export the active robot to URDF/xacro + per-link STL, as a downloadable bundle. */
   exportRobotUrdf: (format?: "urdf" | "xacro") => Promise<void>;
+
+  // --- BIM tabs (Phase 14) ---
+  /** Id of the active BIM tab, or null when not in BIM mode. */
+  activeBimId: string | null;
+  /** Add a new BIM tab and focus it. */
+  addBimTab: () => void;
+  /** Focus a BIM tab (or null to leave BIM mode). */
+  setActiveBim: (bimId: string | null) => void;
+  /** Rename a BIM tab. */
+  renameBim: (bimId: string, name: string) => void;
+  /** Delete a BIM tab. */
+  deleteBim: (bimId: string) => void;
+  /** Add a level to the active BIM tab; returns its id. */
+  addLevel: (name: string, elevation: number, height?: number) => string | null;
+  updateLevel: (levelId: string, patch: Partial<import("./model/bim").Level>) => void;
+  deleteLevel: (levelId: string) => void;
+  /** Add a grid line to the active BIM tab. */
+  addGrid: (label: string, kind: "x" | "y", offset: number) => string | null;
+  updateGrid: (gridId: string, patch: Partial<import("./model/bim").GridLine>) => void;
+  deleteGrid: (gridId: string) => void;
+  /** Add a building component to the active BIM tab; returns its id. */
+  addComponent: (
+    component: import("./model/bim").BuildingComponent,
+  ) => string | null;
+  updateComponent: (
+    componentId: string,
+    patch: Partial<import("./model/bim").BuildingComponent>,
+  ) => void;
+  deleteComponent: (componentId: string) => void;
+  /**
+   * Per-component tessellated meshes for the active BIM tab, keyed by component
+   * id. Massing (wall/slab/column/beam) is built procedurally on the main
+   * thread; hosted-cut walls (Phase 15) come from a kernel boolean.
+   */
+  bimMeshes: Record<string, RenderableShape>;
+  /** Recompute all component meshes for the active BIM tab. */
+  computeBimMeshes: () => Promise<void>;
+  /** Export the active BIM tab to an IFC4 file (browser download). */
+  exportBimIFC: () => Promise<void>;
+  /** Import an IFC4 file as a new BIM tab and focus it. */
+  importBimIFC: (bytes: Uint8Array, name: string) => Promise<void>;
 
   addFeature: (type: "box" | "cylinder") => void;
   /** Add a finished sketch as a SketchFeature node; returns its id. */
@@ -403,6 +460,26 @@ export const useStore = create<AppState>((set, get) => {
   };
 
   /**
+   * Patch the active BIM tab, reconcile hosted-opening + space state (cascade),
+   * persist, then recompute its meshes. Reconciliation is pure (no kernel), so
+   * it runs synchronously here without risking a patch→recompute→patch loop.
+   */
+  const patchBim = (bimId: string, fn: (b: BIMTab) => BIMTab) => {
+    const doc = get().doc;
+    const bims = doc.bims.map((b) => (b.id === bimId ? reconcileBim(fn(b)) : b));
+    set({ doc: { ...doc, bims } });
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void get().saveDoc(), SAVE_DEBOUNCE_MS);
+    void get().computeBimMeshes();
+  };
+
+  /** The active BIM tab, or null. */
+  const activeBim = (): BIMTab | null => {
+    const id = get().activeBimId;
+    return id ? (get().doc.bims.find((b) => b.id === id) ?? null) : null;
+  };
+
+  /**
    * Snapshot the active tab's tree before mutating. `coalesce` merges
    * consecutive edits within COALESCE_MS into one history entry (slider drags).
    */
@@ -461,6 +538,8 @@ export const useStore = create<AppState>((set, get) => {
     activeRobotId: null,
     jointValues: {},
     robotMeshes: {},
+    activeBimId: null,
+    bimMeshes: {},
 
     initKernel: async () => {
       set({ busy: true, error: null });
@@ -718,6 +797,218 @@ export const useStore = create<AppState>((set, get) => {
             // A link with no geometry is skipped; URDF still references it.
           }
         }
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err) });
+      } finally {
+        set({ busy: false });
+      }
+    },
+
+    // --- BIM tab actions (Phase 14) ----------------------------------------
+    addBimTab: () => {
+      const doc = get().doc;
+      const bim = makeBIMTab(`Building ${doc.bims.length + 1}`);
+      set({
+        doc: { ...doc, bims: [...doc.bims, bim] },
+        activeBimId: bim.id,
+        activeRobotId: null, // BIM and Robot modes are mutually exclusive
+      });
+      void get().saveDoc();
+      void get().computeBimMeshes();
+    },
+
+    setActiveBim: (bimId) => {
+      set({ activeBimId: bimId, activeRobotId: null });
+      if (bimId) void get().computeBimMeshes();
+    },
+
+    renameBim: (bimId, name) => {
+      patchBim(bimId, (b) => ({ ...b, name }));
+    },
+
+    deleteBim: (bimId) => {
+      const doc = get().doc;
+      set({
+        doc: { ...doc, bims: doc.bims.filter((b) => b.id !== bimId) },
+        activeBimId: get().activeBimId === bimId ? null : get().activeBimId,
+      });
+      void get().saveDoc();
+    },
+
+    addLevel: (name, elevation, height = 3000) => {
+      const bim = activeBim();
+      if (!bim) return null;
+      const level = makeLevel(name, elevation, height);
+      patchBim(bim.id, (b) => ({ ...b, levels: [...b.levels, level] }));
+      return level.id;
+    },
+
+    updateLevel: (levelId, patch) => {
+      const bim = activeBim();
+      if (!bim) return;
+      patchBim(bim.id, (b) => ({
+        ...b,
+        levels: b.levels.map((l) => (l.id === levelId ? { ...l, ...patch } : l)),
+      }));
+    },
+
+    deleteLevel: (levelId) => {
+      const bim = activeBim();
+      if (!bim) return;
+      // Also drop components on the deleted level (no orphans).
+      patchBim(bim.id, (b) => ({
+        ...b,
+        levels: b.levels.filter((l) => l.id !== levelId),
+        components: b.components.filter((c) => c.levelId !== levelId),
+      }));
+    },
+
+    addGrid: (label, kind, offset) => {
+      const bim = activeBim();
+      if (!bim) return null;
+      const grid = makeGridLine(label, kind, offset);
+      patchBim(bim.id, (b) => ({ ...b, grids: [...b.grids, grid] }));
+      return grid.id;
+    },
+
+    updateGrid: (gridId, patch) => {
+      const bim = activeBim();
+      if (!bim) return;
+      patchBim(bim.id, (b) => ({
+        ...b,
+        grids: b.grids.map((g) => (g.id === gridId ? { ...g, ...patch } : g)),
+      }));
+    },
+
+    deleteGrid: (gridId) => {
+      const bim = activeBim();
+      if (!bim) return;
+      patchBim(bim.id, (b) => ({ ...b, grids: b.grids.filter((g) => g.id !== gridId) }));
+    },
+
+    addComponent: (component) => {
+      const bim = activeBim();
+      if (!bim) return null;
+      patchBim(bim.id, (b) => ({ ...b, components: [...b.components, component] }));
+      return component.id;
+    },
+
+    updateComponent: (componentId, patch) => {
+      const bim = activeBim();
+      if (!bim) return;
+      patchBim(bim.id, (b) => ({
+        ...b,
+        components: b.components.map((c) =>
+          c.id === componentId ? ({ ...c, ...patch } as BuildingComponent) : c,
+        ),
+      }));
+    },
+
+    deleteComponent: (componentId) => {
+      const bim = activeBim();
+      if (!bim) return;
+      patchBim(bim.id, (b) => ({
+        ...b,
+        // Deleting a wall also removes its hosted openings (Phase 15).
+        components: b.components.filter(
+          (c) => c.id !== componentId && !("hostId" in c && c.hostId === componentId),
+        ),
+      }));
+    },
+
+    computeBimMeshes: async () => {
+      const bim = activeBim();
+      if (!bim) {
+        set({ bimMeshes: {} });
+        return;
+      }
+      const { client } = get();
+      const levelById = new Map(bim.levels.map((l) => [l.id, l]));
+      // Group hosted openings by their host wall.
+      const openingsByWall = new Map<string, Opening[]>();
+      for (const c of bim.components) {
+        if (c.type === "door" || c.type === "window") {
+          const list = openingsByWall.get(c.hostId) ?? [];
+          list.push(c);
+          openingsByWall.set(c.hostId, list);
+        }
+      }
+      const meshes: Record<string, RenderableShape> = {};
+      for (const c of bim.components) {
+        const level = levelById.get(c.levelId);
+        if (c.type === "wall") {
+          const openings = openingsByWall.get(c.id) ?? [];
+          if (openings.length > 0) {
+            // Real OCCT boolean: build the cut in the wall's local frame, then
+            // transform the resulting mesh into world space.
+            const plan = planWallCut(c, openings, level);
+            try {
+              const res = await client.regenerate(plan.tree);
+              if (res.mesh) {
+                const world = transformMesh(res.mesh, plan.transform);
+                meshes[c.id] = {
+                  shapeId: -1,
+                  mesh: world,
+                  edges: { points: new Float32Array(0), edgeGroups: new Int32Array(0), edgeCount: 0 },
+                  bbox: bboxOfPositions(world.positions),
+                };
+              }
+            } catch {
+              // Fall back to a solid wall if the boolean fails.
+              meshes[c.id] = bimMeshToRenderable(c.id, wallMesh(c, level));
+            }
+            continue;
+          }
+          meshes[c.id] = bimMeshToRenderable(c.id, wallMesh(c, level));
+        } else if (c.type === "slab") {
+          meshes[c.id] = bimMeshToRenderable(c.id, slabMesh(c, level));
+        } else if (c.type === "column") {
+          meshes[c.id] = bimMeshToRenderable(c.id, columnMesh(c, level));
+        } else if (c.type === "beam") {
+          meshes[c.id] = bimMeshToRenderable(c.id, beamMesh(c, level));
+        }
+      }
+      set({ bimMeshes: meshes });
+    },
+
+    exportBimIFC: async () => {
+      const bim = activeBim();
+      if (!bim) return;
+      set({ busy: true, error: null });
+      try {
+        const { api, wi } = await loadIfc();
+        const { exportIFC, initIfc } = await import("./bim/ifc");
+        initIfc(wi);
+        const { bytes } = exportIFC(api, bim);
+        const blob = new Blob([bytes as BlobPart], { type: "application/x-step" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${sanitizeFilename(bim.name)}.ifc`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err) });
+      } finally {
+        set({ busy: false });
+      }
+    },
+
+    importBimIFC: async (bytes, name) => {
+      set({ busy: true, error: null });
+      try {
+        const { api, wi } = await loadIfc();
+        const { importIFC, initIfc } = await import("./bim/ifc");
+        initIfc(wi);
+        const tab = importIFC(api, bytes, name);
+        const doc = get().doc;
+        set({
+          doc: { ...doc, bims: [...doc.bims, tab] },
+          activeBimId: tab.id,
+          activeRobotId: null,
+        });
+        void get().saveDoc();
+        void get().computeBimMeshes();
       } catch (err) {
         set({ error: err instanceof Error ? err.message : String(err) });
       } finally {
@@ -1393,6 +1684,82 @@ export const useStore = create<AppState>((set, get) => {
     },
   };
 });
+
+/**
+ * Wrap a procedurally-generated BimMesh as a RenderableShape (the shape the
+ * viewport/preview consume). BIM massing has no edge wireframe or kernel handle,
+ * so edges are empty and shapeId is -1; the bbox is computed from positions.
+ */
+function bimMeshToRenderable(id: string, m: BimMesh): RenderableShape {
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < m.positions.length; i += 3) {
+    for (let k = 0; k < 3; k++) {
+      const v = m.positions[i + k];
+      if (v < min[k]) min[k] = v;
+      if (v > max[k]) max[k] = v;
+    }
+  }
+  const triangleCount = m.indices.length / 3;
+  const vertexCount = m.positions.length / 3;
+  return {
+    shapeId: -1,
+    mesh: {
+      positions: m.positions,
+      normals: m.normals,
+      indices: m.indices,
+      vertexCount,
+      triangleCount,
+      // One group spanning all triangles; faceHash seeded from a string hash of
+      // the component id so picking (later) has a stable-ish per-component key.
+      faceGroups: new Int32Array([0, m.indices.length, hashString(id)]),
+      faceCount: 1,
+    },
+    edges: { points: new Float32Array(0), edgeGroups: new Int32Array(0), edgeCount: 0 },
+    bbox: { min, max },
+  };
+}
+
+/** Axis-aligned bbox from an interleaved XYZ position array. */
+function bboxOfPositions(positions: Float32Array): {
+  min: [number, number, number];
+  max: [number, number, number];
+} {
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < positions.length; i += 3) {
+    for (let k = 0; k < 3; k++) {
+      const v = positions[i + k];
+      if (v < min[k]) min[k] = v;
+      if (v > max[k]) max[k] = v;
+    }
+  }
+  return { min, max };
+}
+
+/**
+ * Lazily load + initialize web-ifc (a heavy wasm module) on first IFC use, so
+ * it's kept out of the main bundle. The IfcAPI instance is reused across calls.
+ */
+let ifcApiPromise: Promise<{ api: import("web-ifc").IfcAPI; wi: Record<string, unknown> }> | null = null;
+function loadIfc() {
+  if (!ifcApiPromise) {
+    ifcApiPromise = (async () => {
+      const wi = await import("web-ifc");
+      const api = new wi.IfcAPI();
+      await api.Init();
+      return { api, wi: wi as unknown as Record<string, unknown> };
+    })();
+  }
+  return ifcApiPromise;
+}
+
+/** Small deterministic string hash (djb2), bounded to a positive int32. */
+function hashString(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
 
 /** Make a document name safe to use as a download filename. */
 function sanitizeFilename(name: string): string {

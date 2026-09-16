@@ -56,10 +56,12 @@ export default defineConfig({
     exclude: ["occt-wasm"],
   },
   build: {
-    // three.js is legitimately ~525 KB as its own vendor chunk and can't be
-    // split further without deep tree-shaking; raise the warning threshold so
-    // the build output isn't perpetually noisy about an intentional split.
-    chunkSizeWarningLimit: 600,
+    // three.js is ~525 KB and web-ifc's wasm-loader JS is ~3.4 MB; both are
+    // isolated in their own chunks (web-ifc is lazy-loaded only when IFC
+    // import/export runs, never in the initial bundle), so raise the threshold
+    // past web-ifc so the build output isn't perpetually noisy about an
+    // intentional split.
+    chunkSizeWarningLimit: 4000,
     rollupOptions: {
       output: {
         // Split heavy vendor libs into their own chunks so they cache
