@@ -13,26 +13,33 @@ export function TabBar() {
   const tabs = useStore((s) => s.doc.tabs);
   const robots = useStore((s) => s.doc.robots);
   const bims = useStore((s) => s.doc.bims);
+  const cfds = useStore((s) => s.doc.cfds);
   const activeTabId = useStore((s) => s.doc.activeTabId);
   const activeRobotId = useStore((s) => s.activeRobotId);
   const activeBimId = useStore((s) => s.activeBimId);
+  const activeCfdId = useStore((s) => s.activeCfdId);
   const setActiveTab = useStore((s) => s.setActiveTab);
   const setActiveRobot = useStore((s) => s.setActiveRobot);
   const setActiveBim = useStore((s) => s.setActiveBim);
+  const setActiveCfd = useStore((s) => s.setActiveCfd);
   const addTab = useStore((s) => s.addTab);
   const addRobotTab = useStore((s) => s.addRobotTab);
   const addBimTab = useStore((s) => s.addBimTab);
+  const addCfdTab = useStore((s) => s.addCfdTab);
   const renameTab = useStore((s) => s.renameTab);
   const renameRobot = useStore((s) => s.renameRobot);
   const renameBim = useStore((s) => s.renameBim);
+  const renameCfd = useStore((s) => s.renameCfd);
   const deleteTab = useStore((s) => s.deleteTab);
   const deleteRobot = useStore((s) => s.deleteRobot);
   const deleteBim = useStore((s) => s.deleteBim);
+  const deleteCfd = useStore((s) => s.deleteCfd);
 
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  // A Part Studio tab is "active" only when neither a robot nor a BIM tab is focused.
-  const partStudioActive = activeRobotId === null && activeBimId === null;
+  // A Part Studio tab is "active" only when no additive tab is focused.
+  const partStudioActive =
+    activeRobotId === null && activeBimId === null && activeCfdId === null;
 
   return (
     <div className="flex items-center gap-1 border-b border-neutral-800 bg-neutral-950 px-2 py-1">
@@ -42,8 +49,9 @@ export function TabBar() {
           <div
             key={tab.id}
             onClick={() => {
-              setActiveRobot(null); // leave robot mode
-              setActiveBim(null); // leave BIM mode
+              setActiveRobot(null);
+              setActiveBim(null);
+              setActiveCfd(null);
               setActiveTab(tab.id);
             }}
             onDoubleClick={() => setEditingId(tab.id)}
@@ -113,7 +121,8 @@ export function TabBar() {
           <div
             key={rb.id}
             onClick={() => {
-              setActiveBim(null); // leave BIM mode
+              setActiveBim(null);
+              setActiveCfd(null);
               setActiveRobot(rb.id);
             }}
             onDoubleClick={() => setEditingId(rb.id)}
@@ -173,7 +182,10 @@ export function TabBar() {
         return (
           <div
             key={bm.id}
-            onClick={() => setActiveBim(bm.id)}
+            onClick={() => {
+              setActiveCfd(null);
+              setActiveBim(bm.id);
+            }}
             onDoubleClick={() => setEditingId(bm.id)}
             className={`group flex items-center gap-1 rounded-t px-3 py-1 text-xs ${
               active
@@ -222,6 +234,64 @@ export function TabBar() {
         className="rounded px-2 py-1 text-xs text-emerald-400 hover:bg-neutral-800 hover:text-emerald-200"
       >
         + BIM
+      </button>
+
+      {/* CFD tabs */}
+      {cfds.length > 0 && <div className="mx-1 h-4 w-px bg-neutral-700" />}
+      {cfds.map((cf) => {
+        const active = activeCfdId === cf.id;
+        return (
+          <div
+            key={cf.id}
+            onClick={() => setActiveCfd(cf.id)}
+            onDoubleClick={() => setEditingId(cf.id)}
+            className={`group flex items-center gap-1 rounded-t px-3 py-1 text-xs ${
+              active
+                ? "bg-neutral-800 text-cyan-200"
+                : "cursor-pointer bg-neutral-900 text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+            }`}
+          >
+            {editingId === cf.id ? (
+              <input
+                autoFocus
+                defaultValue={cf.name}
+                onBlur={(e) => {
+                  renameCfd(cf.id, e.target.value.trim() || cf.name);
+                  setEditingId(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  if (e.key === "Escape") setEditingId(null);
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="w-28 rounded border border-blue-500 bg-neutral-900 px-1 text-neutral-100 outline-none"
+              />
+            ) : (
+              <span className="max-w-40 truncate">🌊 {cf.name}</span>
+            )}
+            {editingId !== cf.id && (
+              <button
+                type="button"
+                aria-label={`Delete ${cf.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (window.confirm(`Delete CFD "${cf.name}"?`)) deleteCfd(cf.id);
+                }}
+                className="ml-1 text-neutral-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        onClick={addCfdTab}
+        title="New CFD case"
+        className="rounded px-2 py-1 text-xs text-cyan-400 hover:bg-neutral-800 hover:text-cyan-200"
+      >
+        + CFD
       </button>
     </div>
   );

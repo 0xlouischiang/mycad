@@ -60,6 +60,13 @@ import {
   type BuildingComponent,
 } from "./model/bim";
 import {
+  makeCFDTab,
+  makeBoundaryPatch,
+  type CFDTab,
+  type BoundaryPatch,
+  type PatchType,
+} from "./model/cfd";
+import {
   wallMesh,
   slabMesh,
   columnMesh,
@@ -217,6 +224,33 @@ export interface AppState {
   exportBimIFC: () => Promise<void>;
   /** Import an IFC4 file as a new BIM tab and focus it. */
   importBimIFC: (bytes: Uint8Array, name: string) => Promise<void>;
+
+  // --- CFD tabs ---
+  /** Id of the active CFD tab, or null when not in CFD mode. */
+  activeCfdId: string | null;
+  /** Regenerated source-body mesh for the active CFD tab (ephemeral). */
+  cfdShape: RenderableShape | null;
+  /** Add a new CFD tab referencing the current Part Studio and focus it. */
+  addCfdTab: () => void;
+  /** Focus a CFD tab (or null to leave CFD mode). */
+  setActiveCfd: (cfdId: string | null) => void;
+  renameCfd: (cfdId: string, name: string) => void;
+  deleteCfd: (cfdId: string) => void;
+  /** Patch fields on the active CFD tab. */
+  updateCfd: (patch: Partial<CFDTab>) => void;
+  /** Tag (or retag) faces as a boundary patch on the active CFD tab. */
+  tagBoundary: (
+    faceRefs: string[],
+    type: PatchType,
+    extras?: { name?: string; velocity?: [number, number, number]; gaugePressure?: number },
+  ) => string | null;
+  untagBoundary: (faceRefs: string[]) => void;
+  /** Regenerate the source Part Studio body into cfdShape. */
+  computeCfdMesh: () => Promise<void>;
+  /** Generate the OpenFOAM case and download it as a .zip. */
+  downloadCfdCase: () => Promise<void>;
+  startCfdRun: () => Promise<void>;
+  cancelCfdRun: () => Promise<void>;
 
   addFeature: (type: "box" | "cylinder") => void;
   /** Add a finished sketch as a SketchFeature node; returns its id. */
@@ -479,6 +513,21 @@ export const useStore = create<AppState>((set, get) => {
     return id ? (get().doc.bims.find((b) => b.id === id) ?? null) : null;
   };
 
+  /** Patch a CFD tab by id, then persist. */
+  const patchCfd = (cfdId: string, fn: (c: CFDTab) => CFDTab) => {
+    const doc = get().doc;
+    const cfds = doc.cfds.map((c) => (c.id === cfdId ? fn(c) : c));
+    set({ doc: { ...doc, cfds } });
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void get().saveDoc(), SAVE_DEBOUNCE_MS);
+  };
+
+  /** The active CFD tab, or null. */
+  const activeCfd = (): CFDTab | null => {
+    const id = get().activeCfdId;
+    return id ? (get().doc.cfds.find((c) => c.id === id) ?? null) : null;
+  };
+
   /**
    * Snapshot the active tab's tree before mutating. `coalesce` merges
    * consecutive edits within COALESCE_MS into one history entry (slider drags).
@@ -540,6 +589,8 @@ export const useStore = create<AppState>((set, get) => {
     robotMeshes: {},
     activeBimId: null,
     bimMeshes: {},
+    activeCfdId: null,
+    cfdShape: null,
 
     initKernel: async () => {
       set({ busy: true, error: null });
@@ -555,11 +606,11 @@ export const useStore = create<AppState>((set, get) => {
 
     setActiveTab: (tabId) => {
       const doc = get().doc;
-      if (tabId === doc.activeTabId) return;
       const tab = doc.tabs.find((t) => t.id === tabId);
       if (!tab) return;
       // Swap in the target tab's tree; selection/statuses reset, history is
       // preserved per-tab in `histories`. Regenerate the newly active tree.
+      // Leaving a robot/BIM/CFD tab for a Part Studio also clears those modes.
       const h = historyFor(tabId);
       set({
         doc: { ...doc, activeTabId: tabId },
@@ -570,6 +621,9 @@ export const useStore = create<AppState>((set, get) => {
         canUndo: h.undo.length > 0,
         canRedo: h.redo.length > 0,
         viewingVersionId: null, // leave any read-only version view on tab switch
+        activeRobotId: null,
+        activeBimId: null,
+        activeCfdId: null,
       });
       void get().regenerate();
       void get().saveDoc();
@@ -626,12 +680,20 @@ export const useStore = create<AppState>((set, get) => {
       set({
         doc: { ...doc, robots: [...doc.robots, robot] },
         activeRobotId: robot.id,
+        activeBimId: null,
+        activeCfdId: null,
         jointValues: {},
       });
       void get().saveDoc();
     },
 
-    setActiveRobot: (robotId) => set({ activeRobotId: robotId, jointValues: {} }),
+    setActiveRobot: (robotId) =>
+      set({
+        activeRobotId: robotId,
+        activeBimId: robotId ? null : get().activeBimId,
+        activeCfdId: robotId ? null : get().activeCfdId,
+        jointValues: {},
+      }),
 
     deleteRobot: (robotId) => {
       const doc = get().doc;
@@ -811,14 +873,19 @@ export const useStore = create<AppState>((set, get) => {
       set({
         doc: { ...doc, bims: [...doc.bims, bim] },
         activeBimId: bim.id,
-        activeRobotId: null, // BIM and Robot modes are mutually exclusive
+        activeRobotId: null,
+        activeCfdId: null,
       });
       void get().saveDoc();
       void get().computeBimMeshes();
     },
 
     setActiveBim: (bimId) => {
-      set({ activeBimId: bimId, activeRobotId: null });
+      set({
+        activeBimId: bimId,
+        activeRobotId: bimId ? null : get().activeRobotId,
+        activeCfdId: bimId ? null : get().activeCfdId,
+      });
       if (bimId) void get().computeBimMeshes();
     },
 
@@ -1006,6 +1073,7 @@ export const useStore = create<AppState>((set, get) => {
           doc: { ...doc, bims: [...doc.bims, tab] },
           activeBimId: tab.id,
           activeRobotId: null,
+          activeCfdId: null,
         });
         void get().saveDoc();
         void get().computeBimMeshes();
@@ -1014,6 +1082,152 @@ export const useStore = create<AppState>((set, get) => {
       } finally {
         set({ busy: false });
       }
+    },
+
+    // --- CFD tab actions ----------------------------------------------------
+    addCfdTab: () => {
+      const doc = get().doc;
+      const sourceTab = doc.activeTabId || doc.tabs[0]?.id || "";
+      const cfd = makeCFDTab(`CFD ${doc.cfds.length + 1}`, sourceTab);
+      set({
+        doc: { ...doc, cfds: [...doc.cfds, cfd] },
+        activeCfdId: cfd.id,
+        activeRobotId: null,
+        activeBimId: null,
+      });
+      void get().saveDoc();
+      void get().computeCfdMesh();
+    },
+
+    setActiveCfd: (cfdId) => {
+      set({
+        activeCfdId: cfdId,
+        activeRobotId: cfdId ? null : get().activeRobotId,
+        activeBimId: cfdId ? null : get().activeBimId,
+      });
+      if (cfdId) void get().computeCfdMesh();
+    },
+
+    renameCfd: (cfdId, name) => {
+      patchCfd(cfdId, (c) => ({ ...c, name }));
+    },
+
+    deleteCfd: (cfdId) => {
+      const doc = get().doc;
+      set({
+        doc: { ...doc, cfds: doc.cfds.filter((c) => c.id !== cfdId) },
+        activeCfdId: get().activeCfdId === cfdId ? null : get().activeCfdId,
+        cfdShape: get().activeCfdId === cfdId ? null : get().cfdShape,
+      });
+      void get().saveDoc();
+    },
+
+    updateCfd: (patch) => {
+      const cfd = activeCfd();
+      if (!cfd) return;
+      patchCfd(cfd.id, (c) => ({ ...c, ...patch, kind: "cfd", id: c.id }));
+      if (patch.sourceTab && patch.sourceTab !== cfd.sourceTab) {
+        void get().computeCfdMesh();
+      }
+    },
+
+    tagBoundary: (faceRefs, type, extras = {}) => {
+      const cfd = activeCfd();
+      if (!cfd || faceRefs.length === 0) return null;
+      let lastId: string | null = null;
+      patchCfd(cfd.id, (c) => {
+        const remaining = c.boundaryPatches.filter((p) => !faceRefs.includes(p.faceRef));
+        const used = new Set(remaining.map((p) => p.name));
+        const added: BoundaryPatch[] = [];
+        for (const ref of faceRefs) {
+          let name = extras.name;
+          if (!name) {
+            let n: string = type;
+            let i = 2;
+            while (used.has(n)) n = `${type}_${i++}`;
+            name = n;
+          }
+          used.add(name);
+          const patch = makeBoundaryPatch(ref, type, name, {
+            velocity: extras.velocity,
+            gaugePressure: extras.gaugePressure,
+          });
+          added.push(patch);
+          lastId = patch.id;
+        }
+        return { ...c, boundaryPatches: [...remaining, ...added] };
+      });
+      return lastId;
+    },
+
+    untagBoundary: (faceRefs) => {
+      const cfd = activeCfd();
+      if (!cfd) return;
+      const drop = new Set(faceRefs);
+      patchCfd(cfd.id, (c) => ({
+        ...c,
+        boundaryPatches: c.boundaryPatches.filter((p) => !drop.has(p.faceRef)),
+      }));
+    },
+
+    computeCfdMesh: async () => {
+      const { client, doc, activeCfdId } = get();
+      const cfd = doc.cfds.find((c) => c.id === activeCfdId);
+      if (!cfd) {
+        set({ cfdShape: null });
+        return;
+      }
+      const tab = doc.tabs.find((t) => t.id === cfd.sourceTab);
+      if (!tab) {
+        set({ cfdShape: null, error: `CFD source Part Studio "${cfd.sourceTab}" is missing` });
+        return;
+      }
+      set({ busy: true, error: null });
+      try {
+        const scope = resolveVariableScope(tab.variables, activeConfigOverrides(tab));
+        const active: FeatureTree = {
+          features: tab.tree.features.slice(0, tab.rollbackIndex),
+        };
+        const res = await client.regenerate(resolveTreeExpressions(active, scope));
+        if (res.mesh && res.edges && res.bbox) {
+          set({
+            cfdShape: {
+              shapeId: res.shapeId ?? -1,
+              mesh: res.mesh,
+              edges: res.edges,
+              bbox: res.bbox,
+            },
+          });
+        } else {
+          set({ cfdShape: null });
+        }
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err), cfdShape: null });
+      } finally {
+        set({ busy: false });
+      }
+    },
+
+    downloadCfdCase: async () => {
+      set({ busy: true, error: null });
+      try {
+        const { downloadCfdCaseZip } = await import("./cfd/download");
+        await downloadCfdCaseZip(get);
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err) });
+      } finally {
+        set({ busy: false });
+      }
+    },
+
+    startCfdRun: async () => {
+      const { startCfdJob } = await import("./cfd/run");
+      await startCfdJob(get, set);
+    },
+
+    cancelCfdRun: async () => {
+      const { cancelCfdJob } = await import("./cfd/run");
+      await cancelCfdJob(get, set);
     },
 
     addFeature: (type) => {
@@ -1383,6 +1597,10 @@ export const useStore = create<AppState>((set, get) => {
           lastSavedAt: null,
           canUndo: false,
           canRedo: false,
+          activeRobotId: null,
+          activeBimId: null,
+          activeCfdId: null,
+          cfdShape: null,
         });
         await get().regenerate();
       } catch (err) {
@@ -1403,6 +1621,10 @@ export const useStore = create<AppState>((set, get) => {
         lastSavedAt: null,
         canUndo: false,
         canRedo: false,
+        activeRobotId: null,
+        activeBimId: null,
+        activeCfdId: null,
+        cfdShape: null,
       });
     },
 

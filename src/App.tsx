@@ -25,6 +25,7 @@ import { MassPropertiesPanel } from "./ui/MassPropertiesPanel";
 import { ChatPanel } from "./ui/ChatPanel";
 import { RobotView } from "./robot/RobotView";
 import { BIMView } from "./bim/BIMView";
+import { CFDView } from "./cfd/CFDView";
 import { SketchCanvas } from "./sketch/SketchCanvas";
 import { SketchToolbar } from "./sketch/SketchToolbar";
 
@@ -36,6 +37,7 @@ export default function App() {
   const restoreLast = useStore((s) => s.restoreLast);
   const activeRobotId = useStore((s) => s.activeRobotId);
   const activeBimId = useStore((s) => s.activeBimId);
+  const activeCfdId = useStore((s) => s.activeCfdId);
   const inSketchMode = useSketchStore((s) => s.sketch !== null);
 
   useEffect(() => {
@@ -126,7 +128,9 @@ export default function App() {
         <>
         <DocumentBar />
         <TabBar />
-        {activeBimId !== null ? (
+        {activeCfdId !== null ? (
+          <CFDView />
+        ) : activeBimId !== null ? (
           <BIMView />
         ) : activeRobotId !== null ? (
           <RobotView />

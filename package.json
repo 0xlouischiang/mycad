@@ -21,7 +21,12 @@
     "test:cascade": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/bim/cascade.test.ts",
     "test:ifc": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/bim/ifc.test.ts",
     "test:bimchat": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/commands/bimRegistry.test.ts",
-    "test": "npm run test:solver && npm run test:profile && npm run test:regen && npm run test:robot && npm run test:commands && npm run test:chat && npm run test:proxy && npm run test:bim && npm run test:bimgeom && npm run test:wallcut && npm run test:cascade && npm run test:ifc && npm run test:bimchat"
+    "test:cfd": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/model/cfd.test.ts",
+    "test:cfdcase": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/namedStl.test.ts && node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/zip.test.ts && node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/caseGen.test.ts && node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/residuals.test.ts",
+    "test:cfdchat": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/commands/cfdRegistry.test.ts",
+    "test:cfdapi": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs api/cfd.test.ts",
+    "test:cfdof": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/openfoam.integration.test.ts",
+    "test": "npm run test:solver && npm run test:profile && npm run test:regen && npm run test:robot && npm run test:commands && npm run test:chat && npm run test:proxy && npm run test:bim && npm run test:bimgeom && npm run test:wallcut && npm run test:cascade && npm run test:ifc && npm run test:bimchat && npm run test:cfd && npm run test:cfdcase && npm run test:cfdchat && npm run test:cfdapi"
   },
   "dependencies": {
     "occt-wasm": "^4.4.0",

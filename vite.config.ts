@@ -2,6 +2,7 @@ import { defineConfig, type PluginOption } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { handleChat, type ChatRequest } from "./api/chat";
+import { handleCfd } from "./api/cfd";
 
 /**
  * Dev-only middleware that mounts the /api/chat proxy inside `npm run dev`, so
@@ -40,11 +41,58 @@ function chatProxyPlugin(): PluginOption {
   };
 }
 
+/**
+ * Dev-only middleware mounting the CFD job API (submit/status/log/result/cancel)
+ * at /api/cfd. Reuses handleCfd from api/cfd.ts. OpenFOAM itself runs in Docker;
+ * if Docker is down, submit returns 503 and the client can still download a zip.
+ */
+function cfdProxyPlugin(): PluginOption {
+  return {
+    name: "mycad-cfd-proxy",
+    configureServer(server) {
+      server.middlewares.use("/api/cfd", (req, res) => {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        const query: Record<string, string> = {};
+        url.searchParams.forEach((v, k) => {
+          query[k] = v;
+        });
+        const respond = async (body?: unknown) => {
+          const { status, body: out } = await handleCfd(
+            { method: req.method ?? "GET", path: url.pathname, body, query },
+            process.env,
+          );
+          res.statusCode = status;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(out));
+        };
+        if (req.method === "POST") {
+          let raw = "";
+          req.on("data", (chunk) => (raw += chunk));
+          req.on("end", () => {
+            let body: unknown = {};
+            try {
+              body = JSON.parse(raw || "{}");
+            } catch {
+              res.statusCode = 400;
+              res.setHeader("content-type", "application/json");
+              res.end(JSON.stringify({ error: "invalid JSON body" }));
+              return;
+            }
+            void respond(body);
+          });
+          return;
+        }
+        void respond();
+      });
+    },
+  };
+}
+
 // occt-wasm ships a large .wasm binary that must not be inlined or pre-bundled.
 // We exclude it from Vite's dep optimizer so the worker's `import.meta.url`-based
 // wasm resolution keeps working, and we run the kernel exclusively in a Worker.
 export default defineConfig({
-  plugins: [react(), tailwindcss(), chatProxyPlugin()],
+  plugins: [react(), tailwindcss(), chatProxyPlugin(), cfdProxyPlugin()],
   worker: {
     // The OCCT worker uses ES module imports (occt-wasm), so emit an ESM worker.
     format: "es",

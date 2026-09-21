@@ -95,6 +95,15 @@ export class Viewport {
   /** Callback invoked when the face selection set changes via interaction. */
   onFaceSelectionChange: ((refs: FaceRef[]) => void) | null = null;
 
+  /** Optional wireframe of the CFD far-field / internal domain box. */
+  private domainHelper: THREE.Box3Helper | null = null;
+  /** Per-vertex scalar overlay (pressure / |U|); null restores role/base colors. */
+  private fieldOverlay: Float32Array | null = null;
+  private fieldMin = 0;
+  private fieldMax = 1;
+  /** Optional per-face role colors (CFD patch tagging). */
+  private faceColorMap: Map<FaceRef, [number, number, number]> | null = null;
+
   constructor(container: HTMLElement) {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x1a1a1a);
@@ -281,19 +290,44 @@ export class Viewport {
     const colors = this.faceColors;
     const indices = this.meshGeometry.getIndex();
     if (!indices) return;
-    for (let tri = 0; tri < this.triFaceRefs.length; tri++) {
-      const ref = this.triFaceRefs[tri];
-      const c = this.selectedFaces.has(ref)
-        ? FACE_SELECTED
-        : ref === this.hoveredFace
-          ? FACE_HOVER
-          : FACE_BASE;
-      // Color all three vertices of this triangle.
-      for (let k = 0; k < 3; k++) {
-        const vi = indices.getX(tri * 3 + k) * 3;
-        colors[vi] = c[0];
-        colors[vi + 1] = c[1];
-        colors[vi + 2] = c[2];
+    const pos = this.meshGeometry.getAttribute("position");
+    if (this.fieldOverlay && pos) {
+      const n = pos.count;
+      const span = Math.max(this.fieldMax - this.fieldMin, 1e-12);
+      for (let i = 0; i < n; i++) {
+        const t = (this.fieldOverlay[i] - this.fieldMin) / span;
+        const c = turboColor(t);
+        colors[i * 3] = c[0];
+        colors[i * 3 + 1] = c[1];
+        colors[i * 3 + 2] = c[2];
+      }
+      // Hover/select still overlay on top of the field.
+      for (let tri = 0; tri < this.triFaceRefs.length; tri++) {
+        const ref = this.triFaceRefs[tri];
+        if (!this.selectedFaces.has(ref) && ref !== this.hoveredFace) continue;
+        const c = this.selectedFaces.has(ref) ? FACE_SELECTED : FACE_HOVER;
+        for (let k = 0; k < 3; k++) {
+          const vi = indices.getX(tri * 3 + k) * 3;
+          colors[vi] = c[0];
+          colors[vi + 1] = c[1];
+          colors[vi + 2] = c[2];
+        }
+      }
+    } else {
+      for (let tri = 0; tri < this.triFaceRefs.length; tri++) {
+        const ref = this.triFaceRefs[tri];
+        const role = this.faceColorMap?.get(ref);
+        const c = this.selectedFaces.has(ref)
+          ? FACE_SELECTED
+          : ref === this.hoveredFace
+            ? FACE_HOVER
+            : (role ?? FACE_BASE);
+        for (let k = 0; k < 3; k++) {
+          const vi = indices.getX(tri * 3 + k) * 3;
+          colors[vi] = c[0];
+          colors[vi + 1] = c[1];
+          colors[vi + 2] = c[2];
+        }
       }
     }
     const attr = this.meshGeometry.getAttribute("color");
@@ -309,6 +343,66 @@ export class Viewport {
   clearShape(): void {
     this.mesh.visible = false;
     this.edgeLines.visible = false;
+    this.clearDomainBox();
+    this.fieldOverlay = null;
+    this.faceColorMap = null;
+  }
+
+  /** Draw (or replace) a translucent domain box in model millimetres. */
+  setDomainBox(
+    min: [number, number, number],
+    max: [number, number, number],
+  ): void {
+    this.clearDomainBox();
+    const box = new THREE.Box3(
+      new THREE.Vector3(...min),
+      new THREE.Vector3(...max),
+    );
+    this.domainHelper = new THREE.Box3Helper(box, new THREE.Color(0x22d3ee));
+    this.scene.add(this.domainHelper);
+  }
+
+  clearDomainBox(): void {
+    if (this.domainHelper) {
+      this.scene.remove(this.domainHelper);
+      this.domainHelper.geometry.dispose();
+      (this.domainHelper.material as THREE.Material).dispose();
+      this.domainHelper = null;
+    }
+  }
+
+  /** Per-face role colors (e.g. inlet=green). Cleared by setScalarField. */
+  setFaceColorMap(map: Map<FaceRef, [number, number, number]> | null): void {
+    this.faceColorMap = map;
+    if (!this.fieldOverlay) this.repaintFaces();
+  }
+
+  /**
+   * Color vertices by a per-vertex scalar (length = vertexCount) through a turbo
+   * colormap. Pass null to restore role/base colors.
+   */
+  setFieldOverlay(
+    values: Float32Array | null,
+    range?: { min: number; max: number },
+  ): void {
+    this.fieldOverlay = values;
+    if (values && values.length > 0) {
+      if (range) {
+        this.fieldMin = range.min;
+        this.fieldMax = range.max;
+      } else {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < values.length; i++) {
+          const v = values[i];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        this.fieldMin = lo;
+        this.fieldMax = hi;
+      }
+    }
+    this.repaintFaces();
   }
 
   /** Point the camera at the shape's bounding box and fit it in view. */
@@ -523,6 +617,7 @@ export class Viewport {
     cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.controls.dispose();
+    this.clearDomainBox();
     this.meshGeometry.dispose();
     this.edgeGeometry.dispose();
     (this.mesh.material as THREE.Material).dispose();
@@ -569,4 +664,35 @@ function buildEdgeSegments(
     }
   }
   return { positions: new Float32Array(segments), segmentRefs };
+}
+
+/** Google turbo colormap, t in [0,1] → RGB 0..1. */
+function turboColor(t: number): [number, number, number] {
+  const x = Math.min(1, Math.max(0, t));
+  const r =
+    0.13572138 +
+    4.6153926 * x -
+    42.66032258 * x ** 2 +
+    132.13108234 * x ** 3 -
+    152.94239396 * x ** 4 +
+    59.28637943 * x ** 5;
+  const g =
+    0.09140261 +
+    2.19454389 * x +
+    4.84296658 * x ** 2 -
+    14.18503333 * x ** 3 +
+    4.27729857 * x ** 4 +
+    2.82956604 * x ** 5;
+  const b =
+    0.1066733 +
+    12.64194608 * x -
+    60.58204836 * x ** 2 +
+    110.36276771 * x ** 3 -
+    89.90310912 * x ** 4 +
+    27.34824973 * x ** 5;
+  return [
+    Math.min(1, Math.max(0, r)),
+    Math.min(1, Math.max(0, g)),
+    Math.min(1, Math.max(0, b)),
+  ];
 }
