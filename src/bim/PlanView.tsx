@@ -1,11 +1,12 @@
 /**
  * Plan view (Phase 14): a top-down 2D SVG canvas for authoring BIM components
- * on the active level. Draw walls/beams (2 clicks), columns (1 click), or slabs
- * (polygon; double-click / Enter to close). Points snap to grid lines and to a
- * coarse modular grid. World plan coordinates are (x, y) in mm; the SVG y axis
- * is flipped so +Y points up.
+ * on the active level. Draw walls via continuous chain-clicking (Phase 14a),
+ * beams (2 clicks), columns (1 click), or slabs (polygon; double-click /
+ * Enter to close). Every tool resolves its working point through the shared
+ * `resolveSnapPoint` (src/bim/snapping.ts) instead of ad hoc rounding. World
+ * plan coordinates are (x, y) in mm; the SVG y axis is flipped so +Y points up.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import {
   makeWall,
@@ -19,47 +20,67 @@ import {
   type Point2,
   type Wall,
 } from "../model/bim";
+import { buildSnapCandidates, resolveSnapPoint, type SnapResult } from "./snapping";
+import { useChainDraw } from "./chainDraw";
 
 type Tool = "select" | "wall" | "column" | "beam" | "slab" | "door" | "window" | "space";
 
-const SNAP = 500; // coarse modular snap, mm
-const MM_PER_PX = 20; // view scale: 20 mm per screen px → 1000mm = 50px
+const SNAP_PIXEL_RADIUS = 12; // screen px — kept constant in screen space across zoom
+const MIN_MM_PER_PX = 2;
+const MAX_MM_PER_PX = 200;
 
 export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const addComponent = useStore((s) => s.addComponent);
   const [tool, setTool] = useState<Tool>("wall");
-  const [pending, setPending] = useState<Point2[]>([]);
+  const [pending, setPending] = useState<Point2[]>([]); // slab polygon in progress
   const [cursor, setCursor] = useState<Point2 | null>(null);
+  const [snapResult, setSnapResult] = useState<SnapResult | null>(null);
+  // View scale: mm represented by one screen pixel. No pan in this pass —
+  // only zoom, which is enough to make the screen-pixel snap radius testable.
+  const [mmPerPx, setMmPerPx] = useState(20);
 
   const levelComps = bim.components.filter((c) => c.levelId === levelId);
+  const candidates = buildSnapCandidates(levelComps, bim.grids);
 
-  /** Screen (px, from SVG top-left) → snapped world plan point (mm). */
-  function toWorld(evt: React.MouseEvent): Point2 {
+  const wallChain = useChainDraw({
+    onCommitSegment: (a, b) => addComponent(makeWall(levelId, a, b)),
+    isClosePoint: (p, chainStart) => p.x === chainStart.x && p.y === chainStart.y,
+  });
+
+  /** Screen (px, from SVG top-left) → raw world plan point (mm), no snapping. */
+  function toWorldRaw(evt: { clientX: number; clientY: number }): Point2 {
     const svg = svgRef.current!;
     const rect = svg.getBoundingClientRect();
     const px = evt.clientX - rect.left;
     const py = evt.clientY - rect.top;
     // Center origin; flip Y so up is +Y.
-    const wx = (px - rect.width / 2) * MM_PER_PX;
-    const wy = -(py - rect.height / 2) * MM_PER_PX;
-    return snap({ x: wx, y: wy });
+    const wx = (px - rect.width / 2) * mmPerPx;
+    const wy = -(py - rect.height / 2) * mmPerPx;
+    return { x: wx, y: wy };
   }
 
-  function snap(p: Point2): Point2 {
-    // Snap to grid-line offsets first, else to the modular grid.
-    let x = Math.round(p.x / SNAP) * SNAP;
-    let y = Math.round(p.y / SNAP) * SNAP;
-    for (const g of bim.grids) {
-      if (g.kind === "x" && Math.abs(p.x - g.offset) < SNAP) x = g.offset;
-      if (g.kind === "y" && Math.abs(p.y - g.offset) < SNAP) y = g.offset;
+  /** Screen → world, resolved through the shared snap function unless bypassed (Alt). */
+  function toWorld(evt: React.MouseEvent): Point2 {
+    const raw = toWorldRaw(evt);
+    if (evt.altKey) {
+      setSnapResult({ point: raw, snapped: false });
+      return raw;
     }
-    return { x, y };
+    const result = resolveSnapPoint(raw, candidates, mmPerPx, SNAP_PIXEL_RADIUS);
+    setSnapResult(result);
+    return result.point;
   }
 
   /** World plan (mm) → SVG px, for drawing. */
   function toPx(p: Point2, w: number, h: number): { x: number; y: number } {
-    return { x: w / 2 + p.x / MM_PER_PX, y: h / 2 - p.y / MM_PER_PX };
+    return { x: w / 2 + p.x / mmPerPx, y: h / 2 - p.y / mmPerPx };
+  }
+
+  function handleWheel(evt: React.WheelEvent) {
+    evt.preventDefault();
+    const factor = evt.deltaY > 0 ? 1.1 : 1 / 1.1;
+    setMmPerPx((z) => Math.min(MAX_MM_PER_PX, Math.max(MIN_MM_PER_PX, z * factor)));
   }
 
   function handleClick(evt: React.MouseEvent) {
@@ -69,13 +90,15 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
       addComponent(makeColumn(levelId, p));
       return;
     }
-    if (tool === "wall" || tool === "beam") {
+    if (tool === "wall") {
+      wallChain.click(p);
+      return;
+    }
+    if (tool === "beam") {
       if (pending.length === 0) {
         setPending([p]);
       } else {
-        const a = pending[0];
-        if (tool === "wall") addComponent(makeWall(levelId, a, p));
-        else addComponent(makeBeam(levelId, a, p));
+        addComponent(makeBeam(levelId, pending[0], p));
         setPending([]);
       }
       return;
@@ -100,11 +123,41 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
     }
   }
 
-  function finishSlab() {
+  function finishCurrentTool() {
     if (tool === "slab" && pending.length >= 3) {
       addComponent(makeSlab(levelId, pending));
     }
+    if (tool === "wall") {
+      wallChain.finish();
+      return;
+    }
     setPending([]);
+  }
+
+  // Escape/Enter end the active wall chain. Enter commits the pending
+  // segment first; Escape discards it (already-committed segments are
+  // untouched either way, since each commit already called addComponent).
+  useEffect(() => {
+    if (tool !== "wall" || !wallChain.active) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        wallChain.cancel();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        wallChain.finish();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tool, wallChain]);
+
+  function selectTool(t: Tool) {
+    // Switching tools mid-chain commits the pending segment first rather
+    // than silently discarding it.
+    if (tool === "wall") wallChain.finish();
+    setPending([]);
+    setTool(t);
   }
 
   // Render dimensions come from the SVG's client box; use a viewBox in px.
@@ -119,10 +172,7 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
           <button
             key={t}
             type="button"
-            onClick={() => {
-              setTool(t);
-              setPending([]);
-            }}
+            onClick={() => selectTool(t)}
             className={`rounded px-2 py-1 capitalize ${
               tool === t
                 ? "bg-emerald-700 text-white"
@@ -135,12 +185,18 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
         {tool === "slab" && (
           <button
             type="button"
-            onClick={finishSlab}
+            onClick={finishCurrentTool}
             className="ml-2 rounded bg-blue-700 px-2 py-1 text-white hover:bg-blue-600"
           >
             Finish slab ({pending.length})
           </button>
         )}
+        {tool === "wall" && wallChain.active && (
+          <span className="ml-2 text-neutral-500">
+            chain: {wallChain.points.length} pt{wallChain.points.length === 1 ? "" : "s"} (Esc cancel · Enter/dblclick finish)
+          </span>
+        )}
+        <span className="ml-2 text-neutral-600">alt: no snap · scroll: zoom</span>
         <span className="ml-auto text-neutral-500">
           {cursor ? `(${Math.round(cursor.x)}, ${Math.round(cursor.y)}) mm` : "plan view"}
         </span>
@@ -152,12 +208,20 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
         preserveAspectRatio="xMidYMid meet"
         className="min-h-0 flex-1 bg-neutral-900"
         onClick={handleClick}
-        onDoubleClick={finishSlab}
-        onMouseMove={(e) => setCursor(toWorld(e))}
-        onMouseLeave={() => setCursor(null)}
+        onDoubleClick={finishCurrentTool}
+        onWheel={handleWheel}
+        onMouseMove={(e) => {
+          const p = toWorld(e);
+          setCursor(p);
+          if (tool === "wall") wallChain.updateCursor(p);
+        }}
+        onMouseLeave={() => {
+          setCursor(null);
+          setSnapResult(null);
+        }}
       >
         {/* Modular grid */}
-        <PlanGrid w={W} h={H} />
+        <PlanGrid w={W} h={H} mmPerPx={mmPerPx} />
         {/* Named grid lines */}
         {bim.grids.map((g) => {
           if (g.kind === "x") {
@@ -181,15 +245,15 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
                 x2={b.x}
                 y2={b.y}
                 stroke={c.type === "wall" ? "#e5e0d5" : "#9db0c8"}
-                strokeWidth={Math.max(2, (c.type === "wall" ? c.thickness : c.width) / MM_PER_PX)}
+                strokeWidth={Math.max(2, (c.type === "wall" ? c.thickness : c.width) / mmPerPx)}
                 strokeLinecap="round"
               />
             );
           }
           if (c.type === "column") {
             const p = toPx(c.at, W, H);
-            const w = c.width / MM_PER_PX;
-            const d = c.depth / MM_PER_PX;
+            const w = c.width / mmPerPx;
+            const d = c.depth / mmPerPx;
             return <rect key={c.id} x={p.x - w / 2} y={p.y - d / 2} width={w} height={d} fill="#c8973b" />;
           }
           if (c.type === "slab") {
@@ -231,7 +295,7 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
         })}
 
         {/* In-progress geometry */}
-        {pending.length > 0 && cursor && (tool === "wall" || tool === "beam") && (
+        {pending.length > 0 && cursor && tool === "beam" && (
           <line
             {...lineProps(toPx(pending[0], W, H), toPx(cursor, W, H))}
             stroke="#10b981"
@@ -245,6 +309,38 @@ export function PlanView({ bim, levelId }: { bim: BIMTab; levelId: string }) {
             fill="none"
             stroke="#10b981"
             strokeDasharray="4 4"
+          />
+        )}
+
+        {/* Wall chain: live preview segment from the last point to the snapped cursor, with a length/angle label. */}
+        {tool === "wall" && wallChain.active && wallChain.cursor && (() => {
+          const last = wallChain.points[wallChain.points.length - 1];
+          const a = toPx(last, W, H);
+          const b = toPx(wallChain.cursor, W, H);
+          const dx = wallChain.cursor.x - last.x;
+          const dy = wallChain.cursor.y - last.y;
+          const lengthMm = Math.hypot(dx, dy);
+          const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+          const midX = (a.x + b.x) / 2;
+          const midY = (a.y + b.y) / 2;
+          return (
+            <g>
+              <line {...lineProps(a, b)} stroke="#10b981" strokeWidth={2} strokeDasharray="4 4" />
+              <text x={midX} y={midY - 6} fill="#10b981" fontSize={11} textAnchor="middle">
+                {(lengthMm / 1000).toFixed(2)} m · {angleDeg.toFixed(0)}°
+              </text>
+            </g>
+          );
+        })()}
+
+        {/* Snap indicator: shown before commit, so a click never surprises the user. */}
+        {snapResult?.snapped && cursor && (
+          <circle
+            {...toPx(snapResult.point, W, H)}
+            r={6}
+            fill="none"
+            stroke="#f59e0b"
+            strokeWidth={2}
           />
         )}
       </svg>
@@ -279,9 +375,9 @@ function nearestWall(
   return best;
 }
 
-/** Static modular grid lines behind the plan. */
-function PlanGrid({ w, h }: { w: number; h: number }) {
-  const step = 1000 / MM_PER_PX; // 1m grid
+/** Static modular grid lines behind the plan (visual aid only — not a snap candidate, see snapping.ts). */
+function PlanGrid({ w, h, mmPerPx }: { w: number; h: number; mmPerPx: number }) {
+  const step = 1000 / mmPerPx; // 1m grid
   const lines: React.ReactNode[] = [];
   for (let x = w / 2; x < w; x += step) {
     lines.push(<line key={`x+${x}`} x1={x} y1={0} x2={x} y2={h} stroke="#2a2a2a" />);
