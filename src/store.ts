@@ -67,6 +67,30 @@ import {
   type PatchType,
 } from "./model/cfd";
 import {
+  billOfMaterials,
+  changeLineSpec,
+  checkConnectivity,
+  deleteEquipment,
+  isometric,
+  makeEquipment,
+  makeLine,
+  makeNozzle,
+  makePlantTab,
+  makeSupport,
+  moveEquipment,
+  routeRun,
+  type BomRow,
+  type ConnectivityIssue,
+  type EndPrep,
+  type EquipmentKind,
+  type Isometric,
+  type PlantTab,
+  type SupportKind,
+  type Vec3,
+} from "./model/plant";
+import { equipmentMesh, mergeMeshes, segmentMesh, supportMesh } from "./plant/geometry";
+import { planNozzleCut, transformMesh as transformPlantMesh } from "./plant/nozzleCut";
+import {
   wallMesh,
   slabMesh,
   columnMesh,
@@ -251,6 +275,70 @@ export interface AppState {
   downloadCfdCase: () => Promise<void>;
   startCfdRun: () => Promise<void>;
   cancelCfdRun: () => Promise<void>;
+
+  // --- Plant tabs ---
+  /** Id of the active plant tab, or null when not in plant mode. */
+  activePlantId: string | null;
+  /** Per-component meshes for the active plant tab, keyed by component id. */
+  plantMeshes: Record<string, RenderableShape>;
+  addPlantTab: () => void;
+  /** Focus a plant tab, or null to leave plant mode. */
+  setActivePlant: (plantId: string | null) => void;
+  renamePlant: (plantId: string, name: string) => void;
+  deletePlant: (plantId: string) => void;
+  /** Set the placement context the next line and route inherit. */
+  setPlantContext: (patch: Partial<PlantTab["context"]>) => void;
+  /** Create a line from the active spec and size. Returns its id. */
+  createLine: (name: string, service?: string, unit?: string) => string | null;
+  /**
+   * Route a polyline on a line. `lineId` defaults to the active line. Returns
+   * the route result; on rejection the line is unchanged.
+   */
+  routeLine: (
+    points: Vec3[],
+    lineId?: string,
+    options?: { endPrep?: EndPrep; joinExisting?: boolean },
+  ) => { ok: boolean; error?: string; warnings: string[] };
+  /** Place parametric equipment. Returns its id. */
+  placeEquipment: (
+    name: string,
+    kind: EquipmentKind,
+    origin: Vec3,
+    diameter?: number,
+    length?: number,
+  ) => string | null;
+  /** Move equipment. Its nozzles move with it. */
+  movePlantEquipment: (equipmentId: string, origin: Vec3) => void;
+  deletePlantEquipment: (equipmentId: string) => void;
+  /**
+   * Add a nozzle. With a datum it must belong to the equipment; without one the
+   * nozzle is freeform and `direction` is the face normal it was placed on.
+   */
+  placeNozzle: (
+    equipmentId: string,
+    nozzle: {
+      datumId?: string | null;
+      offset?: Vec3;
+      direction: Vec3;
+      nps: number;
+      rating?: string;
+      facing?: EndPrep;
+      lineId?: string | null;
+    },
+  ) => string | null;
+  placePlantSupport: (hostSegmentId: string, t: number, kind: SupportKind) => string | null;
+  /** Replace what the new spec allows; flag the rest. Nothing is deleted. */
+  changePlantSpec: (
+    lineId: string,
+    specId: string,
+    nps: number,
+  ) => { replaced: number; warned: string[] } | { error: string };
+  plantConnectivity: (lineId: string) => ConnectivityIssue[] | { error: string };
+  plantBom: (lineId: string) => BomRow[] | { error: string };
+  plantIsometric: (lineId: string) => Isometric | { error: string };
+  /** Delete a line, or one component of a line. */
+  deletePlantComponent: (id: string) => void;
+  computePlantMeshes: () => Promise<void>;
 
   addFeature: (type: "box" | "cylinder") => void;
   /** Add a finished sketch as a SketchFeature node; returns its id. */
@@ -528,6 +616,22 @@ export const useStore = create<AppState>((set, get) => {
     return id ? (get().doc.cfds.find((c) => c.id === id) ?? null) : null;
   };
 
+  /** Patch a plant tab by id, persist, then rebuild its meshes. */
+  const patchPlant = (plantId: string, fn: (p: PlantTab) => PlantTab) => {
+    const doc = get().doc;
+    const plants = doc.plants.map((p) => (p.id === plantId ? fn(p) : p));
+    set({ doc: { ...doc, plants } });
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void get().saveDoc(), SAVE_DEBOUNCE_MS);
+    void get().computePlantMeshes();
+  };
+
+  /** The active plant tab, or null. */
+  const activePlant = (): PlantTab | null => {
+    const id = get().activePlantId;
+    return id ? (get().doc.plants.find((p) => p.id === id) ?? null) : null;
+  };
+
   /**
    * Snapshot the active tab's tree before mutating. `coalesce` merges
    * consecutive edits within COALESCE_MS into one history entry (slider drags).
@@ -591,6 +695,8 @@ export const useStore = create<AppState>((set, get) => {
     bimMeshes: {},
     activeCfdId: null,
     cfdShape: null,
+    activePlantId: null,
+    plantMeshes: {},
 
     initKernel: async () => {
       set({ busy: true, error: null });
@@ -624,6 +730,7 @@ export const useStore = create<AppState>((set, get) => {
         activeRobotId: null,
         activeBimId: null,
         activeCfdId: null,
+        activePlantId: null,
       });
       void get().regenerate();
       void get().saveDoc();
@@ -682,6 +789,7 @@ export const useStore = create<AppState>((set, get) => {
         activeRobotId: robot.id,
         activeBimId: null,
         activeCfdId: null,
+        activePlantId: null,
         jointValues: {},
       });
       void get().saveDoc();
@@ -692,6 +800,7 @@ export const useStore = create<AppState>((set, get) => {
         activeRobotId: robotId,
         activeBimId: robotId ? null : get().activeBimId,
         activeCfdId: robotId ? null : get().activeCfdId,
+        activePlantId: robotId ? null : get().activePlantId,
         jointValues: {},
       }),
 
@@ -875,6 +984,7 @@ export const useStore = create<AppState>((set, get) => {
         activeBimId: bim.id,
         activeRobotId: null,
         activeCfdId: null,
+        activePlantId: null,
       });
       void get().saveDoc();
       void get().computeBimMeshes();
@@ -885,6 +995,7 @@ export const useStore = create<AppState>((set, get) => {
         activeBimId: bimId,
         activeRobotId: bimId ? null : get().activeRobotId,
         activeCfdId: bimId ? null : get().activeCfdId,
+        activePlantId: bimId ? null : get().activePlantId,
       });
       if (bimId) void get().computeBimMeshes();
     },
@@ -1074,6 +1185,7 @@ export const useStore = create<AppState>((set, get) => {
           activeBimId: tab.id,
           activeRobotId: null,
           activeCfdId: null,
+          activePlantId: null,
         });
         void get().saveDoc();
         void get().computeBimMeshes();
@@ -1094,6 +1206,7 @@ export const useStore = create<AppState>((set, get) => {
         activeCfdId: cfd.id,
         activeRobotId: null,
         activeBimId: null,
+        activePlantId: null,
       });
       void get().saveDoc();
       void get().computeCfdMesh();
@@ -1104,6 +1217,7 @@ export const useStore = create<AppState>((set, get) => {
         activeCfdId: cfdId,
         activeRobotId: cfdId ? null : get().activeRobotId,
         activeBimId: cfdId ? null : get().activeBimId,
+        activePlantId: cfdId ? null : get().activePlantId,
       });
       if (cfdId) void get().computeCfdMesh();
     },
@@ -1228,6 +1342,246 @@ export const useStore = create<AppState>((set, get) => {
     cancelCfdRun: async () => {
       const { cancelCfdJob } = await import("./cfd/run");
       await cancelCfdJob(get, set);
+    },
+
+    // --- Plant tab actions ---------------------------------------------------
+    addPlantTab: () => {
+      const doc = get().doc;
+      const plant = makePlantTab(`Plant ${doc.plants.length + 1}`);
+      set({
+        doc: { ...doc, plants: [...doc.plants, plant] },
+        activePlantId: plant.id,
+        activeRobotId: null,
+        activeBimId: null,
+        activeCfdId: null,
+      });
+      void get().saveDoc();
+      void get().computePlantMeshes();
+    },
+
+    setActivePlant: (plantId) => {
+      set({
+        activePlantId: plantId,
+        activeRobotId: plantId ? null : get().activeRobotId,
+        activeBimId: plantId ? null : get().activeBimId,
+        activeCfdId: plantId ? null : get().activeCfdId,
+      });
+      if (plantId) void get().computePlantMeshes();
+    },
+
+    renamePlant: (plantId, name) => {
+      patchPlant(plantId, (p) => ({ ...p, name }));
+    },
+
+    deletePlant: (plantId) => {
+      const doc = get().doc;
+      set({
+        doc: { ...doc, plants: doc.plants.filter((p) => p.id !== plantId) },
+        activePlantId: get().activePlantId === plantId ? null : get().activePlantId,
+        plantMeshes: get().activePlantId === plantId ? {} : get().plantMeshes,
+      });
+      void get().saveDoc();
+    },
+
+    setPlantContext: (patch) => {
+      const plant = activePlant();
+      if (!plant) return;
+      patchPlant(plant.id, (p) => ({ ...p, context: { ...p.context, ...patch } }));
+    },
+
+    createLine: (name, service = "", unit = "") => {
+      const plant = activePlant();
+      if (!plant) return null;
+      const spec = plant.specs.find((s) => s.id === plant.context.activeSpecId) ?? plant.specs[0];
+      if (!spec) return null;
+      const nps = plant.context.activeNps ?? spec.nps[0];
+      if (!spec.nps.includes(nps)) return null;
+      const line = makeLine(name, spec, nps, service, unit);
+      patchPlant(plant.id, (p) => ({
+        ...p,
+        lines: [...p.lines, line],
+        context: { ...p.context, activeLineId: line.id, activeSpecId: spec.id, activeNps: nps },
+      }));
+      return line.id;
+    },
+
+    routeLine: (points, lineId, options) => {
+      const plant = activePlant();
+      if (!plant) return { ok: false, error: "no active plant tab", warnings: [] };
+      const target = lineId ?? plant.context.activeLineId;
+      if (!target) return { ok: false, error: "no active line; create one first", warnings: [] };
+      let result = { ok: false, error: "line not found", warnings: [] as string[] };
+      patchPlant(plant.id, (p) => {
+        const routed = routeRun(p, target, points, options);
+        result = { ok: routed.ok, error: routed.error ?? "route rejected", warnings: routed.warnings };
+        return p;
+      });
+      return result;
+    },
+
+    placeEquipment: (name, kind, origin, diameter, length) => {
+      const plant = activePlant();
+      if (!plant) return null;
+      const equipment = makeEquipment(name, kind, origin, diameter, length);
+      patchPlant(plant.id, (p) => ({ ...p, equipment: [...p.equipment, equipment] }));
+      return equipment.id;
+    },
+
+    movePlantEquipment: (equipmentId, origin) => {
+      const plant = activePlant();
+      if (!plant) return;
+      patchPlant(plant.id, (p) => ({
+        ...p,
+        equipment: p.equipment.map((e) => {
+          if (e.id !== equipmentId) return e;
+          moveEquipment(e, origin);
+          return e;
+        }),
+      }));
+    },
+
+    deletePlantEquipment: (equipmentId) => {
+      const plant = activePlant();
+      if (!plant) return;
+      patchPlant(plant.id, (p) => {
+        deleteEquipment(p, equipmentId);
+        return p;
+      });
+    },
+
+    placeNozzle: (equipmentId, nozzle) => {
+      const plant = activePlant();
+      if (!plant) return null;
+      const equipment = plant.equipment.find((e) => e.id === equipmentId);
+      if (!equipment) return null;
+      const datum = nozzle.datumId ? equipment.datums.find((d) => d.id === nozzle.datumId) : undefined;
+      if (nozzle.datumId && !datum) return null;
+      const freeform = !datum;
+      const made = makeNozzle(
+        datum ? datum.id : null,
+        nozzle.offset ?? { x: 0, y: 0, z: 0 },
+        nozzle.direction,
+        nozzle.nps,
+        nozzle.rating ?? "150",
+        nozzle.facing ?? "flanged",
+        freeform,
+      );
+      made.lineId = nozzle.lineId ?? null;
+      patchPlant(plant.id, (p) => ({
+        ...p,
+        equipment: p.equipment.map((e) =>
+          e.id === equipmentId ? { ...e, nozzles: [...e.nozzles, made] } : e,
+        ),
+      }));
+      return made.id;
+    },
+
+    placePlantSupport: (hostSegmentId, t, kind) => {
+      const plant = activePlant();
+      if (!plant) return null;
+      const hosts = plant.lines.some((l) => l.runs.some((r) => r.id === hostSegmentId && r.kind === "straight"));
+      if (!hosts) return null;
+      const support = makeSupport(hostSegmentId, t, kind);
+      patchPlant(plant.id, (p) => ({ ...p, supports: [...p.supports, support] }));
+      return support.id;
+    },
+
+    changePlantSpec: (lineId, specId, nps) => {
+      const plant = activePlant();
+      if (!plant) return { error: "no active plant tab" };
+      let result: { replaced: number; warned: string[] } | { error: string } = { error: "line not found" };
+      patchPlant(plant.id, (p) => {
+        const changed = changeLineSpec(p, lineId, specId, nps);
+        result = changed;
+        return p;
+      });
+      return result;
+    },
+
+    plantConnectivity: (lineId) => {
+      const line = activePlant()?.lines.find((l) => l.id === lineId);
+      if (!line) return { error: `no line "${lineId}"` };
+      return checkConnectivity(line);
+    },
+
+    plantBom: (lineId) => {
+      const plant = activePlant();
+      if (!plant) return { error: "no active plant tab" };
+      return billOfMaterials(plant, lineId);
+    },
+
+    plantIsometric: (lineId) => {
+      const line = activePlant()?.lines.find((l) => l.id === lineId);
+      if (!line) return { error: `no line "${lineId}"` };
+      return isometric(line);
+    },
+
+    deletePlantComponent: (id) => {
+      const plant = activePlant();
+      if (!plant) return;
+      patchPlant(plant.id, (p) => ({
+        ...p,
+        lines: p.lines
+          .filter((l) => l.id !== id)
+          .map((l) => ({
+            ...l,
+            // Drop a single component and any joint that touched it.
+            runs: l.runs.filter((r) => r.id !== id),
+            joints: l.joints.filter((j) => {
+              const owners = new Set(l.runs.filter((r) => r.id !== id).flatMap((r) => r.ports.map((port) => port.id)));
+              return owners.has(j.a) && owners.has(j.b);
+            }),
+          })),
+        supports: p.supports.filter((s) => s.hostSegmentId !== id && s.id !== id),
+      }));
+    },
+
+    computePlantMeshes: async () => {
+      const plant = activePlant();
+      if (!plant) {
+        set({ plantMeshes: {} });
+        return;
+      }
+      const meshes: Record<string, RenderableShape> = {};
+      for (const line of plant.lines) {
+        const parts = line.runs.map(segmentMesh).filter((m): m is BimMesh => m !== null);
+        if (parts.length > 0) meshes[line.id] = bimMeshToRenderable(line.id, mergeMeshes(parts));
+      }
+      for (const support of plant.supports) {
+        const host = plant.lines.flatMap((l) => l.runs).find((r) => r.id === support.hostSegmentId);
+        if (!host || host.ports.length < 2) continue;
+        const a = host.ports[0].position;
+        const b = host.ports[1].position;
+        const at = {
+          x: a.x + (b.x - a.x) * support.t,
+          y: a.y + (b.y - a.y) * support.t,
+          z: a.z + (b.z - a.z) * support.t,
+        };
+        meshes[support.id] = bimMeshToRenderable(support.id, supportMesh(at));
+      }
+      const { client } = get();
+      for (const equipment of plant.equipment) {
+        const plan = planNozzleCut(equipment, equipment.nozzles);
+        if (plan.hasCut && client) {
+          try {
+            const res = await client.regenerate(plan.tree);
+            if (res.mesh) {
+              const world = transformPlantMesh(res.mesh, plan.transform);
+              meshes[equipment.id] = {
+                shapeId: -1,
+                mesh: world,
+                edges: { points: new Float32Array(0), edgeGroups: new Int32Array(0), edgeCount: 0 },
+                bbox: bboxOfPositions(world.positions),
+              };
+              continue;
+            }
+          } catch {
+            // Fall back to the procedural body when the bore fails.
+          }
+        }
+        meshes[equipment.id] = bimMeshToRenderable(equipment.id, equipmentMesh(equipment));
+      }
+      set({ plantMeshes: meshes });
     },
 
     addFeature: (type) => {
@@ -1600,6 +1954,7 @@ export const useStore = create<AppState>((set, get) => {
           activeRobotId: null,
           activeBimId: null,
           activeCfdId: null,
+          activePlantId: null,
           cfdShape: null,
         });
         await get().regenerate();
@@ -1624,6 +1979,7 @@ export const useStore = create<AppState>((set, get) => {
         activeRobotId: null,
         activeBimId: null,
         activeCfdId: null,
+        activePlantId: null,
         cfdShape: null,
       });
     },

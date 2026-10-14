@@ -26,6 +26,7 @@ import { ChatPanel } from "./ui/ChatPanel";
 import { RobotView } from "./robot/RobotView";
 import { BIMView } from "./bim/BIMView";
 import { CFDView } from "./cfd/CFDView";
+import { PlantView } from "./plant/PlantView";
 import { SketchCanvas } from "./sketch/SketchCanvas";
 import { SketchToolbar } from "./sketch/SketchToolbar";
 
@@ -38,6 +39,7 @@ export default function App() {
   const activeRobotId = useStore((s) => s.activeRobotId);
   const activeBimId = useStore((s) => s.activeBimId);
   const activeCfdId = useStore((s) => s.activeCfdId);
+  const activePlantId = useStore((s) => s.activePlantId);
   const inSketchMode = useSketchStore((s) => s.sketch !== null);
 
   useEffect(() => {
@@ -128,7 +130,9 @@ export default function App() {
         <>
         <DocumentBar />
         <TabBar />
-        {activeCfdId !== null ? (
+        {activePlantId !== null ? (
+          <PlantView />
+        ) : activeCfdId !== null ? (
           <CFDView />
         ) : activeBimId !== null ? (
           <BIMView />

@@ -14,32 +14,38 @@ export function TabBar() {
   const robots = useStore((s) => s.doc.robots);
   const bims = useStore((s) => s.doc.bims);
   const cfds = useStore((s) => s.doc.cfds);
+  const plants = useStore((s) => s.doc.plants);
   const activeTabId = useStore((s) => s.doc.activeTabId);
   const activeRobotId = useStore((s) => s.activeRobotId);
   const activeBimId = useStore((s) => s.activeBimId);
   const activeCfdId = useStore((s) => s.activeCfdId);
+  const activePlantId = useStore((s) => s.activePlantId);
   const setActiveTab = useStore((s) => s.setActiveTab);
   const setActiveRobot = useStore((s) => s.setActiveRobot);
   const setActiveBim = useStore((s) => s.setActiveBim);
   const setActiveCfd = useStore((s) => s.setActiveCfd);
+  const setActivePlant = useStore((s) => s.setActivePlant);
   const addTab = useStore((s) => s.addTab);
   const addRobotTab = useStore((s) => s.addRobotTab);
   const addBimTab = useStore((s) => s.addBimTab);
   const addCfdTab = useStore((s) => s.addCfdTab);
+  const addPlantTab = useStore((s) => s.addPlantTab);
   const renameTab = useStore((s) => s.renameTab);
   const renameRobot = useStore((s) => s.renameRobot);
   const renameBim = useStore((s) => s.renameBim);
   const renameCfd = useStore((s) => s.renameCfd);
+  const renamePlant = useStore((s) => s.renamePlant);
   const deleteTab = useStore((s) => s.deleteTab);
   const deleteRobot = useStore((s) => s.deleteRobot);
   const deleteBim = useStore((s) => s.deleteBim);
   const deleteCfd = useStore((s) => s.deleteCfd);
+  const deletePlant = useStore((s) => s.deletePlant);
 
   const [editingId, setEditingId] = useState<string | null>(null);
 
   // A Part Studio tab is "active" only when no additive tab is focused.
   const partStudioActive =
-    activeRobotId === null && activeBimId === null && activeCfdId === null;
+    activeRobotId === null && activeBimId === null && activeCfdId === null && activePlantId === null;
 
   return (
     <div className="flex items-center gap-1 border-b border-neutral-800 bg-neutral-950 px-2 py-1">
@@ -52,6 +58,7 @@ export function TabBar() {
               setActiveRobot(null);
               setActiveBim(null);
               setActiveCfd(null);
+              setActivePlant(null);
               setActiveTab(tab.id);
             }}
             onDoubleClick={() => setEditingId(tab.id)}
@@ -123,6 +130,7 @@ export function TabBar() {
             onClick={() => {
               setActiveBim(null);
               setActiveCfd(null);
+              setActivePlant(null);
               setActiveRobot(rb.id);
             }}
             onDoubleClick={() => setEditingId(rb.id)}
@@ -184,6 +192,7 @@ export function TabBar() {
             key={bm.id}
             onClick={() => {
               setActiveCfd(null);
+              setActivePlant(null);
               setActiveBim(bm.id);
             }}
             onDoubleClick={() => setEditingId(bm.id)}
@@ -243,7 +252,10 @@ export function TabBar() {
         return (
           <div
             key={cf.id}
-            onClick={() => setActiveCfd(cf.id)}
+            onClick={() => {
+              setActivePlant(null);
+              setActiveCfd(cf.id);
+            }}
             onDoubleClick={() => setEditingId(cf.id)}
             className={`group flex items-center gap-1 rounded-t px-3 py-1 text-xs ${
               active
@@ -292,6 +304,64 @@ export function TabBar() {
         className="rounded px-2 py-1 text-xs text-cyan-400 hover:bg-neutral-800 hover:text-cyan-200"
       >
         + CFD
+      </button>
+
+      {/* Plant tabs */}
+      {plants.length > 0 && <div className="mx-1 h-4 w-px bg-neutral-700" />}
+      {plants.map((pl) => {
+        const active = activePlantId === pl.id;
+        return (
+          <div
+            key={pl.id}
+            onClick={() => setActivePlant(pl.id)}
+            onDoubleClick={() => setEditingId(pl.id)}
+            className={`group flex items-center gap-1 rounded-t px-3 py-1 text-xs ${
+              active
+                ? "bg-neutral-800 text-orange-200"
+                : "cursor-pointer bg-neutral-900 text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+            }`}
+          >
+            {editingId === pl.id ? (
+              <input
+                autoFocus
+                defaultValue={pl.name}
+                onBlur={(e) => {
+                  renamePlant(pl.id, e.target.value.trim() || pl.name);
+                  setEditingId(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  if (e.key === "Escape") setEditingId(null);
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="w-28 rounded border border-blue-500 bg-neutral-900 px-1 text-neutral-100 outline-none"
+              />
+            ) : (
+              <span className="max-w-40 truncate">🔧 {pl.name}</span>
+            )}
+            {editingId !== pl.id && (
+              <button
+                type="button"
+                aria-label={`Delete ${pl.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (window.confirm(`Delete plant "${pl.name}"?`)) deletePlant(pl.id);
+                }}
+                className="ml-1 text-neutral-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        onClick={addPlantTab}
+        title="New plant model"
+        className="rounded px-2 py-1 text-xs text-orange-400 hover:bg-neutral-800 hover:text-orange-200"
+      >
+        + Plant
       </button>
     </div>
   );

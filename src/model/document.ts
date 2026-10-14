@@ -22,6 +22,7 @@ import { evalExpr, type VarScope } from "./expr";
 import type { RobotTab } from "./robot";
 import type { BIMTab } from "./bim";
 import type { CFDTab } from "./cfd";
+import type { PlantTab } from "./plant";
 
 /**
  * A named variable local to a Part Studio. `expression` is an expr.ts string
@@ -91,6 +92,12 @@ export interface CADDocument {
    * and `bims`: the Part Studio path is untouched.
    */
   cfds: CFDTab[];
+  /**
+   * Plant tabs — an additive piping layer (specs, lines, equipment, supports).
+   * Kept as a separate list for the same reason as `bims`: the Part Studio path
+   * is untouched. Geometry is derived, not stored.
+   */
+  plants: PlantTab[];
   /** Id of the currently active tab. Always references a tab in `tabs`. */
   activeTabId: string;
   /** Active robot tab id when a robot tab is focused, else null. */
@@ -127,6 +134,7 @@ export function makeDocument(name = "Untitled"): CADDocument {
     robots: [],
     bims: [],
     cfds: [],
+    plants: [],
     activeTabId: tab.id,
     activeRobotId: null,
     activeBimId: null,
@@ -165,6 +173,7 @@ export function migrateToDocument(raw: unknown): CADDocument {
       bims: (r.bims as BIMTab[] | undefined) ?? [],
       activeBimId: (r.activeBimId as string | null | undefined) ?? null,
       cfds: (r.cfds as CFDTab[] | undefined) ?? [],
+      plants: (r.plants as PlantTab[] | undefined) ?? [],
     };
   }
   // v1 single-tree document → wrap in one Part Studio.
@@ -186,6 +195,7 @@ export function migrateToDocument(raw: unknown): CADDocument {
     robots: [],
     bims: [],
     cfds: [],
+    plants: [],
     activeTabId: tab.id,
     activeRobotId: null,
     activeBimId: null,
