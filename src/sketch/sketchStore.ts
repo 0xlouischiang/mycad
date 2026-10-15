@@ -12,14 +12,26 @@
 import { create } from "zustand";
 import {
   BASE_PLANES,
+  ORIGIN_ID,
   makeSketch,
   newSketchId,
   type Constraint,
   type ConstraintType,
+  type DistanceAxis,
+  type DistanceConstraint,
   type Sketch,
   type SketchPlane,
   type SketchPlaneId,
 } from "../model/sketch";
+import type { VarScope } from "../model/expr";
+import { measure } from "./dimension";
+import {
+  applySketchExprs,
+  isDimensional,
+  magnitudeError,
+  parseDimInput,
+  storedValue,
+} from "./sketchExprs";
 import { solveSketch } from "./solver";
 import { SNAP } from "./preview";
 import { applyCascade, collectCascade } from "./deleteCascade";
@@ -54,7 +66,7 @@ interface SketchStore {
    */
   pending: { tool: SketchTool; pointIds: string[] } | null;
   /** Last solver result, for status display. */
-  lastSolve: { converged: boolean; residual: number } | null;
+  lastSolve: { converged: boolean; residual: number; dof: number; redundant: number } | null;
   /** Number of sides for the polygon tool (>= 3). */
   polygonSides: number;
   /** Set the polygon tool's side count. */
@@ -99,6 +111,33 @@ interface SketchStore {
   addConstraint: (type: ConstraintType, value?: number) => string | null;
 
   /**
+   * Distance-dimension placement. The Distance tool resolves its two points
+   * from the selection (2 points, or 1 line → its endpoints) and enters this
+   * state; the canvas previews aligned/horizontal/vertical from the cursor
+   * (see dimension.ts) and `placeDimension` commits the previewed mode.
+   */
+  dimension: { p1: string; p2: string } | null;
+  /** Start placing a distance from the current selection; error or null. */
+  beginDistance: () => string | null;
+  cancelDimension: () => void;
+  /**
+   * Commit the previewed dimension at the CURRENT measured value (so nothing
+   * moves until the user types one). Returns the new constraint id, or null.
+   */
+  placeDimension: (axis: DistanceAxis, offset: number) => string | null;
+  /** Move a placed dimension's line (rendering only; one undo step per drag). */
+  setDimensionOffset: (constraintId: string, offset: number) => void;
+  /**
+   * Set a dimension from user input: a number or a variable expression,
+   * entered as a magnitude (sign rule: sketchExprs.ts). Error or null.
+   */
+  setDimensionInput: (constraintId: string, raw: string) => string | null;
+  /** Variable scope that dimension expressions evaluate against. */
+  varScope: VarScope;
+  /** Update the scope and re-solve any expression-driven dimensions. */
+  setVarScope: (scope: VarScope) => void;
+
+  /**
    * Fillet the corner between the two selected lines with the given radius:
    * trims both lines back to the tangent points and inserts a tangent arc.
    * Returns an error message or null on success.
@@ -108,7 +147,11 @@ interface SketchStore {
   /** Finish the in-progress spline (commits it and starts a fresh draft). */
   finishSpline: () => void;
 
-  /** Edit a dimensional constraint's value (distance/angle/radius) + re-solve. */
+  /**
+   * Edit a dimensional constraint's value (distance/angle/radius) + re-solve.
+   * `value` is the displayed magnitude: horizontal/vertical distances keep
+   * their stored side. Clears any expression on the constraint.
+   */
   updateConstraintValue: (constraintId: string, value: number) => void;
 
   /**
@@ -196,7 +239,12 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     const result = solveSketch(next, pinned ? { pinned } : undefined);
     set({
       sketch: next,
-      lastSolve: { converged: result.converged, residual: result.residual },
+      lastSolve: {
+        converged: result.converged,
+        residual: result.residual,
+        dof: result.dof,
+        redundant: result.redundant,
+      },
       canUndo: history.undo.length > 0,
       canRedo: history.redo.length > 0,
     });
@@ -214,9 +262,15 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     set((st) => ({
       sketch: snap,
       pending: null,
+      dimension: null,
       selectedPoints: st.selectedPoints.filter((id) => pts.has(id)),
       selectedEntities: st.selectedEntities.filter((id) => ents.has(id)),
-      lastSolve: { converged: result.converged, residual: result.residual },
+      lastSolve: {
+        converged: result.converged,
+        residual: result.residual,
+        dof: result.dof,
+        redundant: result.redundant,
+      },
       canUndo: history.undo.length > 0,
       canRedo: history.redo.length > 0,
     }));
@@ -226,6 +280,17 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     const id = newSketchId("pt");
     s.points.push({ id, u, v, fixed });
     return id;
+  };
+
+  /**
+   * Every sketch in the editor carries a fixed origin point at (0,0) so users
+   * can dimension to it. It's `fixed`, so the delete cascade never removes it
+   * as an orphan, and profile extraction ignores it (no entity uses it).
+   * Sketches saved before this existed get it when opened for editing.
+   */
+  const withOrigin = (sk: Sketch): Sketch => {
+    if (sk.points.some((p) => p.id === ORIGIN_ID)) return sk;
+    return { ...sk, points: [{ id: ORIGIN_ID, u: 0, v: 0, fixed: true }, ...sk.points] };
   };
 
   /** Find an existing point near (u,v), or create one. */
@@ -245,6 +310,8 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     lastSolve: null,
     canUndo: false,
     canRedo: false,
+    dimension: null,
+    varScope: {},
     polygonSides: 6,
     setPolygonSides: (n) => set({ polygonSides: Math.max(3, Math.round(n)) }),
 
@@ -252,8 +319,9 @@ export const useSketchStore = create<SketchStore>((set, get) => {
       resetHistory();
       set({ canUndo: false, canRedo: false });
       set({
-        sketch: makeSketch(newSketchId("sk"), planeId, planeOffset),
+        sketch: withOrigin(makeSketch(newSketchId("sk"), planeId, planeOffset)),
         editingFeatureId: null,
+        dimension: null,
         tool: "select",
         selectedPoints: [],
         selectedEntities: [],
@@ -269,8 +337,9 @@ export const useSketchStore = create<SketchStore>((set, get) => {
       const sketch = makeSketch(newSketchId("sk"), "XY", 0);
       sketch.customPlane = plane;
       set({
-        sketch,
+        sketch: withOrigin(sketch),
         editingFeatureId: null,
+        dimension: null,
         tool: "select",
         selectedPoints: [],
         selectedEntities: [],
@@ -289,9 +358,14 @@ export const useSketchStore = create<SketchStore>((set, get) => {
         entities: sketch.entities.map((e) => ({ ...e })),
         constraints: sketch.constraints.map((c) => ({ ...c })),
       };
+      // Re-evaluate expression dims against the current variables on open.
+      const opened = withOrigin(clone);
+      applySketchExprs(opened, get().varScope);
+      solveSketch(opened);
       set({
-        sketch: clone,
+        sketch: opened,
         editingFeatureId: featureId,
+        dimension: null,
         tool: "select",
         selectedPoints: [],
         selectedEntities: [],
@@ -312,6 +386,7 @@ export const useSketchStore = create<SketchStore>((set, get) => {
         selectedPoints: [],
         selectedEntities: [],
         pending: null,
+        dimension: null,
       });
       return { sketch, editingFeatureId };
     },
@@ -326,10 +401,12 @@ export const useSketchStore = create<SketchStore>((set, get) => {
         selectedPoints: [],
         selectedEntities: [],
         pending: null,
+        dimension: null,
       });
     },
 
     setTool: (tool) => {
+      if (get().dimension) set({ dimension: null });
       // Switching away from the spline tool commits the in-progress spline.
       if (get().tool === "spline" && tool !== "spline") get().finishSpline();
       set({ tool, pending: null });
@@ -357,13 +434,116 @@ export const useSketchStore = create<SketchStore>((set, get) => {
       if (!Number.isFinite(value)) return;
       commit((s) => {
         const c = s.constraints.find((x) => x.id === constraintId);
-        if (
-          c &&
-          (c.type === "distance" || c.type === "angle" || c.type === "radius")
-        ) {
-          c.value = value;
+        if (c && isDimensional(c)) {
+          c.value = storedValue(c, value);
+          delete c.expr;
         }
       });
+    },
+
+    beginDistance: () => {
+      const { sketch, selectedPoints, selectedEntities } = get();
+      if (!sketch) return "No active sketch";
+      let pair: [string, string] | null = null;
+      if (selectedPoints.length === 2 && selectedEntities.length === 0) {
+        pair = [selectedPoints[0], selectedPoints[1]];
+      } else if (selectedEntities.length === 1 && selectedPoints.length === 0) {
+        const e = sketch.entities.find((x) => x.id === selectedEntities[0]);
+        if (e?.type === "line") pair = [e.p1, e.p2];
+      }
+      // Point-to-line distance has no solver residual yet, so it isn't offered.
+      if (!pair) return "Select 2 points (the origin counts) or 1 line";
+      if (pair[0] === pair[1]) return "Pick two different points";
+      set({ dimension: { p1: pair[0], p2: pair[1] }, pending: null });
+      return null;
+    },
+
+    cancelDimension: () => set({ dimension: null }),
+
+    placeDimension: (axis, offset) => {
+      const { sketch, dimension } = get();
+      if (!sketch || !dimension) return null;
+      const a = sketch.points.find((p) => p.id === dimension.p1);
+      const b = sketch.points.find((p) => p.id === dimension.p2);
+      set({ dimension: null });
+      if (!a || !b) return null;
+      const value = measure(a, b, axis);
+      const id = newSketchId("cn");
+      // Aligned dims keep the legacy shape (no axis field). x/y record the
+      // side they were placed on so later edits never flip it.
+      const c: DistanceConstraint =
+        axis === "aligned"
+          ? { id, type: "distance", p1: dimension.p1, p2: dimension.p2, value, offset }
+          : {
+              id,
+              type: "distance",
+              p1: dimension.p1,
+              p2: dimension.p2,
+              value,
+              axis,
+              dir: value < 0 ? -1 : 1,
+              offset,
+            };
+      commit((s) => {
+        s.constraints.push(c);
+      });
+      return id;
+    },
+
+    setDimensionOffset: (constraintId, offset) => {
+      const sketch = get().sketch;
+      if (!sketch) return;
+      // Placement only: no re-solve (geometry is unaffected), but one
+      // coalesced undo step per drag, like point drags.
+      const now = Date.now();
+      const key = `dimdrag:${constraintId}`;
+      if (!(history.lastKey === key && now - history.lastAt < COALESCE_MS)) {
+        history.undo.push(structuredClone(sketch));
+        if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
+      }
+      history.redo = [];
+      history.lastKey = key;
+      history.lastAt = now;
+      set({
+        sketch: {
+          ...sketch,
+          constraints: sketch.constraints.map((c) =>
+            c.id === constraintId && c.type === "distance" ? { ...c, offset } : c,
+          ),
+        },
+        canUndo: true,
+        canRedo: false,
+      });
+    },
+
+    setDimensionInput: (constraintId, raw) => {
+      const { sketch, varScope } = get();
+      if (!sketch) return "No active sketch";
+      const c = sketch.constraints.find((x) => x.id === constraintId);
+      if (!c || !isDimensional(c)) return "Not a dimension";
+      const r = parseDimInput(raw, varScope);
+      if (!r.ok) return r.error;
+      const bad = magnitudeError(c, r.value);
+      if (bad) return bad;
+      commit((s) => {
+        const t = s.constraints.find((x) => x.id === constraintId);
+        if (!t || !isDimensional(t)) return;
+        t.value = storedValue(t, r.value);
+        if (r.expr) t.expr = r.expr;
+        else delete t.expr;
+      });
+      return null;
+    },
+
+    setVarScope: (scope) => {
+      set({ varScope: scope });
+      const sketch = get().sketch;
+      if (!sketch) return;
+      if (!applySketchExprs(structuredClone(sketch), scope)) return;
+      // Variable edits re-drive the sketch but aren't sketch-undo steps.
+      commit((s) => {
+        applySketchExprs(s, scope);
+      }, undefined, null);
     },
 
     addSketchMirror: (mirrorLineId) => {
@@ -868,6 +1048,9 @@ export const useSketchStore = create<SketchStore>((set, get) => {
       if (!shared) return "Selected lines must share a corner";
       const pById = (id: string) => sketch.points.find((p) => p.id === id)!;
       const corner = pById(shared);
+      // Filleting trims by moving the corner point; a fixed point (e.g. the
+      // origin) can't move.
+      if (corner.fixed) return "Can't fillet a corner on a fixed point (e.g. the origin)";
       const far1 = pById(l1.p1 === shared ? l1.p2 : l1.p1);
       const far2 = pById(l2.p1 === shared ? l2.p2 : l2.p1);
 
@@ -932,8 +1115,14 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     deleteSelected: () => {
-      const { sketch, selectedPoints, selectedEntities, pending } = get();
-      if (!sketch || (selectedPoints.length === 0 && selectedEntities.length === 0)) return;
+      const { sketch, selectedEntities, pending } = get();
+      // The sketch origin is permanent reference geometry: selecting it (or
+      // sweeping it into a box-select) never deletes it.
+      const selectedPoints = get().selectedPoints.filter((id) => id !== ORIGIN_ID);
+      if (!sketch || (selectedPoints.length === 0 && selectedEntities.length === 0)) {
+        set({ selectedPoints: [], selectedEntities: [] });
+        return;
+      }
       const cascade = collectCascade(
         sketch,
         selectedPoints,

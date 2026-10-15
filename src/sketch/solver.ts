@@ -12,7 +12,9 @@
  * The Jacobian J is computed numerically (central differences). This is more
  * than fast enough for MVP-sized sketches (tens of points) and avoids
  * hand-deriving analytic gradients for every constraint type — a deliberate
- * simplicity-over-speed tradeoff for the MVP.
+ * simplicity-over-speed tradeoff for the MVP. (Central differences are exact
+ * for linear residuals such as horizontal/vertical distance, so those need no
+ * analytic Jacobian.)
  *
  * Damping (λ) makes it robust to redundant/over-constrained systems and near
  * singular configurations: it never blows up, it just makes limited progress.
@@ -25,13 +27,14 @@
  * NO external dependencies (per project constraints). Small dense linear
  * algebra is implemented inline.
  */
-import type {
-  ArcEntity,
-  CircleEntity,
-  LineEntity,
-  Sketch,
-  SketchEntity,
-  SketchPoint,
+import {
+  distanceAxis,
+  type ArcEntity,
+  type CircleEntity,
+  type LineEntity,
+  type Sketch,
+  type SketchEntity,
+  type SketchPoint,
 } from "../model/sketch";
 
 export interface SolveOptions {
@@ -54,8 +57,17 @@ export interface SolveResult {
   iterations: number;
   /** Max absolute residual at the end. */
   residual: number;
-  /** True if the system appears over/under-constrained (diagnostic only). */
+  /**
+   * Remaining degrees of freedom: free variables minus the rank of the
+   * constraint Jacobian at the solution. 0 = fully constrained.
+   */
   dof: number;
+  /**
+   * Constraints that add no information (Jacobian rows dependent on others),
+   * e.g. a 0 horizontal distance on a vertical line. With converged=false the
+   * dependent rows are conflicting instead of merely redundant.
+   */
+  redundant: number;
 }
 
 /**
@@ -144,12 +156,17 @@ export function solveSketch(
     return mx;
   };
 
-  const dof = 2 * countFreePoints(sketch, pinned) - m; // rough DOF estimate
-
   if (n === 0 || m === 0) {
     // Nothing to solve (no free vars or no constraints). Still write back.
     writeBack(sketch, work);
-    return { converged: true, iterations: 0, residual: maxAbs(evalResiduals()), dof };
+    const residual = maxAbs(evalResiduals());
+    return {
+      converged: residual < tolerance * 100,
+      iterations: 0,
+      residual,
+      dof: n,
+      redundant: m,
+    };
   }
 
   // Weak Tikhonov regularization anchoring each free variable to its value at
@@ -242,12 +259,19 @@ export function solveSketch(
   syncWorkFromX();
   writeBack(sketch, work);
 
+  // DOF / redundancy from the Jacobian's rank at the solution: each
+  // independent residual removes one DOF; dependent rows are redundant (or
+  // conflicting, if the solve didn't converge).
+  const rank = matrixRank(numericJacobian(x, n, m, evalResiduals), m, n);
+  syncWorkFromX();
+
   const finalResidual = maxAbs(r);
   return {
     converged: finalResidual < tolerance * 100, // generous: near-satisfied
     iterations: iter,
     residual: finalResidual,
-    dof,
+    dof: n - rank,
+    redundant: m - rank,
   };
 }
 
@@ -333,11 +357,20 @@ function buildResiduals(
       }
       case "distance": {
         const { p1, p2, value } = c;
-        fns.push((u, v) => {
-          const dx = u(p2) - u(p1);
-          const dy = v(p2) - v(p1);
-          return Math.sqrt(dx * dx + dy * dy) - value;
-        });
+        const axis = distanceAxis(c);
+        if (axis === "x") {
+          // Linear, signed: depends only on u1,u2 (∂/∂u1 = −1, ∂/∂u2 = +1).
+          // No length division, so coincident points and value 0 are fine.
+          fns.push((u) => u(p2) - u(p1) - value);
+        } else if (axis === "y") {
+          fns.push((_u, v) => v(p2) - v(p1) - value);
+        } else {
+          fns.push((u, v) => {
+            const dx = u(p2) - u(p1);
+            const dy = v(p2) - v(p1);
+            return Math.sqrt(dx * dx + dy * dy) - value;
+          });
+        }
         break;
       }
       case "angle": {
@@ -561,8 +594,38 @@ function solveLinear(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function countFreePoints(sketch: Sketch, pinned: Set<string>): number {
-  return sketch.points.filter((p) => !p.fixed && !pinned.has(p.id)).length;
+/**
+ * Numerical rank of a dense m×n matrix via Gaussian elimination with partial
+ * pivoting. Tolerance is relative to the largest entry; central-difference
+ * noise (~1e-10) sits far below it, real dependencies collapse to ~0.
+ */
+function matrixRank(J: Float64Array, m: number, n: number): number {
+  const A = J.slice();
+  let maxEntry = 0;
+  for (let i = 0; i < A.length; i++) maxEntry = Math.max(maxEntry, Math.abs(A[i]));
+  const tol = 1e-6 * Math.max(1, maxEntry);
+  let rank = 0;
+  for (let col = 0; col < n && rank < m; col++) {
+    let piv = rank;
+    for (let i = rank + 1; i < m; i++) {
+      if (Math.abs(A[i * n + col]) > Math.abs(A[piv * n + col])) piv = i;
+    }
+    if (Math.abs(A[piv * n + col]) <= tol) continue;
+    if (piv !== rank) {
+      for (let k = 0; k < n; k++) {
+        const t = A[rank * n + k];
+        A[rank * n + k] = A[piv * n + k];
+        A[piv * n + k] = t;
+      }
+    }
+    for (let i = rank + 1; i < m; i++) {
+      const f = A[i * n + col] / A[rank * n + col];
+      if (f === 0) continue;
+      for (let k = col; k < n; k++) A[i * n + k] -= f * A[rank * n + k];
+    }
+    rank++;
+  }
+  return rank;
 }
 
 function writeBack(sketch: Sketch, work: Map<string, number>): void {

@@ -5,7 +5,7 @@
  */
 import { useSketchStore } from "./sketchStore";
 import { collectCascade } from "./deleteCascade";
-import { makeSketch, type Sketch, type SketchPoint } from "../model/sketch";
+import { ORIGIN_ID, makeSketch, type Sketch, type SketchPoint } from "../model/sketch";
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = "") {
@@ -13,9 +13,11 @@ function check(label: string, cond: boolean, detail = "") {
   console.log(`  [${cond ? "PASS" : "FAIL"}] ${label}${detail ? " — " + detail : ""}`);
 }
 const sk = () => useSketchStore.getState();
+/** User points only: the fixed sketch origin is always present and never deleted. */
+const userPoints = () => sk().sketch!.points.filter((p) => p.id !== ORIGIN_ID);
 const counts = () => {
   const s = sk().sketch!;
-  return { pts: s.points.length, ents: s.entities.length, cons: s.constraints.length };
+  return { pts: userPoints().length, ents: s.entities.length, cons: s.constraints.length };
 };
 const fmt = (c: { pts: number; ents: number; cons: number }) => `${c.pts}p/${c.ents}e/${c.cons}c`;
 const sameCounts = (a: object, b: object) => JSON.stringify(a) === JSON.stringify(b);
@@ -31,9 +33,10 @@ function line(a: [number, number], b: [number, number]) {
   sk().setTool("select");
 }
 function rect() {
+  // Geometry is kept away from (0,0) so it doesn't snap onto the fixed origin.
   sk().setTool("rectangle");
-  sk().clickAt(0, 0, null);
-  sk().clickAt(20, 10, null);
+  sk().clickAt(100, 0, null);
+  sk().clickAt(120, 10, null);
   sk().setTool("select");
 }
 function del(entities: string[], points: string[] = []) {
@@ -65,7 +68,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
 {
   console.log("Isolated line");
   fresh();
-  line([0, 0], [10, 0]);
+  line([100, 0], [110, 0]);
   check("built 2p/1e", sameCounts(counts(), { pts: 2, ents: 1, cons: 0 }), fmt(counts()));
   delWithUndoCheck("isolated line", entIds());
   check("line + both endpoints gone", sameCounts(counts(), { pts: 0, ents: 0, cons: 0 }), fmt(counts()));
@@ -82,6 +85,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   sk().undo();
   del(entIds());
   check("whole rectangle → nothing left", sameCounts(counts(), { pts: 0, ents: 0, cons: 0 }), fmt(counts()));
+  check("origin survives deleting everything", sk().sketch!.points.some((p) => p.id === ORIGIN_ID));
 }
 
 {
@@ -98,10 +102,10 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   console.log("Line chain: delete middle segment");
   fresh();
   sk().setTool("line");
-  sk().clickAt(0, 0, null);
-  sk().clickAt(10, 0, null);
-  sk().clickAt(20, 5, null);
-  sk().clickAt(30, 0, null);
+  sk().clickAt(100, 0, null);
+  sk().clickAt(110, 0, null);
+  sk().clickAt(120, 5, null);
+  sk().clickAt(130, 0, null);
   sk().setTool("select");
   check("built 4p/3e", sameCounts(counts(), { pts: 4, ents: 3, cons: 0 }), fmt(counts()));
   del([entIds()[1]]);
@@ -112,9 +116,9 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   // Fresh chain: deleting the END segment removes only its free end.
   fresh();
   sk().setTool("line");
-  sk().clickAt(0, 0, null);
-  sk().clickAt(10, 0, null);
-  sk().clickAt(20, 5, null);
+  sk().clickAt(100, 0, null);
+  sk().clickAt(110, 0, null);
+  sk().clickAt(120, 5, null);
   sk().setTool("select");
   del([entIds()[1]]);
   check("end segment: only its free end removed", sameCounts(counts(), { pts: 2, ents: 1, cons: 0 }), fmt(counts()));
@@ -124,10 +128,10 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   console.log("Two circles sharing a center");
   fresh();
   sk().setTool("circle");
-  sk().clickAt(0, 0, null);
-  sk().clickAt(5, 0, null);
-  sk().clickAt(0.5, 0, null); // snaps onto the existing center
-  sk().clickAt(9, 0, null);
+  sk().clickAt(100, 0, null);
+  sk().clickAt(105, 0, null);
+  sk().clickAt(100.5, 0, null); // snaps onto the existing center
+  sk().clickAt(109, 0, null);
   sk().setTool("select");
   check("built 1p/2e (shared center)", sameCounts(counts(), { pts: 1, ents: 2, cons: 0 }), fmt(counts()));
   del([entIds()[0]]);
@@ -140,7 +144,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   console.log("Spline owns its through-points");
   fresh();
   sk().setTool("spline");
-  for (const [u, v] of [[0, 0], [10, 5], [20, -5], [30, 0]]) sk().clickAt(u, v, null);
+  for (const [u, v] of [[100, 0], [110, 5], [120, -5], [130, 0]]) sk().clickAt(u, v, null);
   sk().setTool("select"); // commits the spline
   check("built 4p/1e", sameCounts(counts(), { pts: 4, ents: 1, cons: 0 }), fmt(counts()));
   delWithUndoCheck("spline", entIds());
@@ -150,9 +154,9 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
 {
   console.log("Point held only by a dimension is orphaned; spanning coincident is dropped");
   fresh();
-  line([0, 0], [10, 0]);
-  line([20, 0], [30, 0]);
-  const pts = sk().sketch!.points.map((p) => p.id);
+  line([100, 0], [110, 0]);
+  line([120, 0], [130, 0]);
+  const pts = userPoints().map((p) => p.id);
   // Distance dim between the two lines' near endpoints (pts[1], pts[2]).
   sk().selectPoint(pts[1], false);
   sk().selectPoint(pts[2], true);
@@ -160,7 +164,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   const [first] = entIds();
   del([first]);
   const s = sk().sketch!;
-  check("first line + both endpoints gone (dim doesn't keep pts[1])", !s.points.some((p) => p.id === pts[1]) && s.points.length === 2);
+  check("first line + both endpoints gone (dim doesn't keep pts[1])", !s.points.some((p) => p.id === pts[1]) && userPoints().length === 2);
   check("dimension removed with it", s.constraints.length === 0);
   check("solver still converges", sk().lastSolve?.converged === true);
 }
@@ -169,7 +173,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   console.log("Deleting a point still removes the shapes built on it");
   fresh();
   rect();
-  const corner = sk().sketch!.points[0].id;
+  const corner = userPoints()[0].id;
   delWithUndoCheck("corner point", [], [corner]);
   // Corner p1 kills bottom + left; p2/p4 are still used by right/top, so only
   // the selected corner itself goes. No line is left with a missing endpoint.
@@ -198,7 +202,7 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   console.log("Undo housekeeping");
   fresh();
   check("fresh sketch has nothing to undo", !sk().canUndo);
-  line([0, 0], [10, 0]);
+  line([100, 0], [110, 0]);
   sk().selectEntity(entIds()[0], false);
   sk().deleteSelected();
   check("selection cleared after delete", sk().selectedEntities.length === 0 && sk().selectedPoints.length === 0);
@@ -206,11 +210,29 @@ function delWithUndoCheck(label: string, entities: string[], points: string[] = 
   sk().deleteSelected();
   check("delete with empty selection records nothing", (sk().undo(), counts().ents === 1));
   // Drag coalescing: many moves of one point = one undo step.
-  const pid = sk().sketch!.points[0].id;
-  const start = sk().sketch!.points[0].u;
+  const pid = userPoints()[0].id;
+  const start = userPoints()[0].u;
   for (let i = 1; i <= 20; i++) sk().dragPoint(pid, start - i, 0);
   sk().undo();
   check("20-move drag undone in one step", sk().sketch!.points.find((p) => p.id === pid)!.u === start);
+}
+
+{
+  console.log("Origin can't be deleted, even when selected or box-selected");
+  fresh();
+  line([100, 0], [110, 0]);
+  sk().selectBox([ORIGIN_ID, ...userPoints().map((p) => p.id)], [], false);
+  sk().deleteSelected();
+  check(
+    "user geometry deleted, origin kept",
+    counts().pts === 0 && sk().sketch!.points.some((p) => p.id === ORIGIN_ID),
+  );
+  sk().selectPoint(ORIGIN_ID, false);
+  sk().deleteSelected();
+  check(
+    "origin alone selected → no-op, selection cleared",
+    sk().sketch!.points.some((p) => p.id === ORIGIN_ID) && sk().selectedPoints.length === 0,
+  );
 }
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);

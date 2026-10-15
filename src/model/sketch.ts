@@ -201,13 +201,50 @@ export interface PairLineConstraint {
   b: string; // line entity id
 }
 
-/** Fixed distance between two points (a driven dimension). */
+/**
+ * Which component of p1→p2 a distance dimension fixes:
+ *   - "aligned": straight-line length, |p2 − p1| = value (value ≥ 0).
+ *   - "x": horizontal offset only, u2 − u1 = value (v free).
+ *   - "y": vertical offset only,   v2 − v1 = value (u free).
+ */
+export type DistanceAxis = "aligned" | "x" | "y";
+
+/**
+ * Fixed distance between two points (a driven dimension).
+ *
+ * Backward compatible: sketches saved before `axis` existed have no axis and
+ * are treated as "aligned" everywhere (see distanceAxis()).
+ *
+ * For "x"/"y", `value` is SIGNED (the solver target for u2−u1 / v2−v1) and the
+ * UI shows |value|. `dir` records the direction the dimension was placed in
+ * (sign of the offset at commit time); an entered number n is stored as
+ * dir·n, so editing the number never flips the side, and the signed residual
+ * holds the side while dragging. A NEGATIVE entry therefore puts p2 on the
+ * opposite side of p1 — documented UI rule, applied equally to literals and
+ * expressions.
+ */
 export interface DistanceConstraint {
   id: string;
   type: "distance";
   p1: string;
   p2: string;
   value: number;
+  axis?: DistanceAxis;
+  /** "x"/"y" only: committed direction (+1 / −1). Missing = +1. */
+  dir?: 1 | -1;
+  /**
+   * "x"/"y" only: where the dimension line sits, as an offset (plane units)
+   * from the two points' midpoint along the perpendicular axis (v for "x",
+   * u for "y"). Rendering only; never affects the solve.
+   */
+  offset?: number;
+  /** Optional variable expression driving the value (e.g. "width/2"). */
+  expr?: string;
+}
+
+/** A distance constraint's axis, defaulting legacy (axis-less) data to aligned. */
+export function distanceAxis(c: DistanceConstraint): DistanceAxis {
+  return c.axis ?? "aligned";
 }
 
 /** Fixed angle (degrees) between two lines. */
@@ -217,6 +254,8 @@ export interface AngleConstraint {
   a: string; // line entity id
   b: string; // line entity id
   value: number; // degrees
+  /** Optional variable expression driving the value. */
+  expr?: string;
 }
 
 /** Fixed radius for a circle or arc. */
@@ -225,7 +264,12 @@ export interface RadiusConstraint {
   type: "radius";
   entity: string; // circle or arc entity id
   value: number;
+  /** Optional variable expression driving the value. */
+  expr?: string;
 }
+
+/** Id of the fixed sketch origin point (0,0) every edited sketch carries. */
+export const ORIGIN_ID = "origin";
 
 /** Two circles/arcs share a center point (their center points coincide). */
 export interface ConcentricConstraint {

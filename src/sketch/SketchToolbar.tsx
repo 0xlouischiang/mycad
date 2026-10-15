@@ -8,7 +8,7 @@
  * (distance/angle/radius) prompt for a value. A status line shows solver
  * convergence.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSketchStore, type SketchTool } from "./sketchStore";
 import { useStore } from "../store";
 import type { ConstraintType } from "../model/sketch";
@@ -46,6 +46,45 @@ const DIMENSIONAL: { type: ConstraintType; label: string; prompt: string }[] = [
   { type: "radius", label: "Radius", prompt: "Radius value:" },
 ];
 
+/**
+ * Solver status: conflicts first (a dimension that can't be met, e.g. a
+ * horizontal distance between points already constrained vertical), then
+ * redundancy, then remaining degrees of freedom.
+ */
+function SolveStatus({
+  solve,
+}: {
+  solve: { converged: boolean; residual: number; dof?: number; redundant?: number };
+}) {
+  const title = `max residual ${solve.residual.toExponential(2)}`;
+  if (!solve.converged) {
+    return (
+      <span role="status" className="text-red-400" title={title}>
+        Conflicting constraints: undo the last one or change a value
+      </span>
+    );
+  }
+  if (solve.redundant && solve.redundant > 0) {
+    return (
+      <span role="status" className="text-yellow-500" title={title}>
+        solved · {solve.redundant} redundant constraint{solve.redundant > 1 ? "s" : ""}
+      </span>
+    );
+  }
+  if (solve.dof === 0) {
+    return (
+      <span role="status" className="text-green-500" title={title}>
+        fully constrained
+      </span>
+    );
+  }
+  return (
+    <span role="status" className="text-green-500" title={title}>
+      solved{solve.dof !== undefined ? ` · ${solve.dof} DOF` : ""}
+    </span>
+  );
+}
+
 export function SketchToolbar() {
   const tool = useSketchStore((s) => s.tool);
   const setTool = useSketchStore((s) => s.setTool);
@@ -59,10 +98,20 @@ export function SketchToolbar() {
   const addSketchMirror = useSketchStore((s) => s.addSketchMirror);
   const deleteSelected = useSketchStore((s) => s.deleteSelected);
   const lastSolve = useSketchStore((s) => s.lastSolve);
+  const beginDistance = useSketchStore((s) => s.beginDistance);
+  const placingDim = useSketchStore((s) => s.dimension !== null);
   const planeId = useSketchStore((s) => s.sketch?.planeId);
   const addSketchFeature = useStore((s) => s.addSketchFeature);
   const updateSketch = useStore((s) => s.updateSketch);
   const [message, setMessage] = useState<string | null>(null);
+  // Drop the placement hint once a dimension is placed or cancelled.
+  const [hintShown, setHintShown] = useState(false);
+  useEffect(() => {
+    if (!placingDim && hintShown) {
+      setMessage(null);
+      setHintShown(false);
+    }
+  }, [placingDim, hintShown]);
 
   /** Commit the sketch into the feature tree (new node or update existing). */
   const finishSketch = () => {
@@ -190,23 +239,37 @@ export function SketchToolbar() {
           </IconButton>
         ))}
         <div className="mx-1 h-5 w-px bg-neutral-700" />
-        {DIMENSIONAL.map((c) => (
-          <IconButton key={c.type} label={`${c.label}…`} onClick={() => apply(c.type, c.prompt)}>
-            <ToolIcon name={c.type} />
-          </IconButton>
-        ))}
+        {DIMENSIONAL.map((c) =>
+          c.type === "distance" ? (
+            // Distance: one tool, three modes. Pick 2 points (or a line),
+            // then the canvas previews aligned / horizontal / vertical from
+            // where the cursor is; click to place, then type the value.
+            <IconButton
+              key={c.type}
+              label="Distance (aligned / horizontal / vertical)"
+              active={placingDim}
+              onClick={() => {
+                const err = beginDistance();
+                setHintShown(err === null);
+                setMessage(
+                  err ??
+                    "Move above/below for horizontal, left/right for vertical, diagonal for aligned. Click to place, Esc to cancel.",
+                );
+              }}
+            >
+              <ToolIcon name={c.type} />
+            </IconButton>
+          ) : (
+            <IconButton key={c.type} label={`${c.label}…`} onClick={() => apply(c.type, c.prompt)}>
+              <ToolIcon name={c.type} />
+            </IconButton>
+          ),
+        )}
       </div>
 
       <div className="flex items-center justify-between text-[11px]">
         <span className="text-neutral-500">{message}</span>
-        {lastSolve && (
-          <span
-            className={lastSolve.converged ? "text-green-500" : "text-yellow-500"}
-            title={`max residual ${lastSolve.residual.toExponential(2)}`}
-          >
-            {lastSolve.converged ? "solved" : "under/over-constrained"}
-          </span>
-        )}
+        {lastSolve && <SolveStatus solve={lastSolve} />}
       </div>
     </div>
   );

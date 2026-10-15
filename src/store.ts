@@ -32,6 +32,8 @@ import {
   type FeatureTree,
 } from "./model/featureTree";
 import { makeSketch, newSketchId, type Sketch } from "./model/sketch";
+import { applySketchExprs, sketchHasExprs } from "./sketch/sketchExprs";
+import { solveSketch } from "./sketch/solver";
 import type { EdgeRef, FaceRef } from "./model/edgeRef";
 import {
   activeConfigOverrides,
@@ -2428,6 +2430,14 @@ function resolveTreeExpressions(
   scope: Record<string, number>,
 ): FeatureTree {
   const features = tree.features.map((f) => {
+    // Sketch dimensions can be variable-driven too: re-evaluate them and
+    // re-solve so downstream features see the updated profile.
+    if (f.type === "sketch") {
+      if (!sketchHasExprs(f.sketch)) return f;
+      const sketch = structuredClone(f.sketch);
+      if (applySketchExprs(sketch, scope)) solveSketch(sketch);
+      return { ...f, sketch } as Feature;
+    }
     const exprs = f.exprs;
     if (!exprs || Object.keys(exprs).length === 0) return f;
     // Only solid/modifier features carry a `params` bag; sketch/linked/sweep

@@ -12,6 +12,7 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
 import { useSketchStore } from "./sketch/sketchStore";
+import { activeConfigOverrides, activeStudio, resolveVariableScope } from "./model/document";
 import { ViewportView } from "./viewport/ViewportView";
 import { FeatureTreePanel } from "./ui/FeatureTreePanel";
 import { ParameterEditor } from "./ui/ParameterEditor";
@@ -46,6 +47,17 @@ export default function App() {
     // Init the kernel, then restore the most recent document (if any).
     void initKernel().then(() => restoreLast());
   }, [initKernel, restoreLast]);
+
+  // Feed the active Part Studio's variable scope (incl. configuration
+  // overrides) to the sketch editor, so variable-driven dimensions evaluate
+  // and re-solve live. Keyed on a JSON digest to skip no-op updates.
+  const scopeKey = useStore((s) => {
+    const studio = activeStudio(s.doc);
+    return JSON.stringify(resolveVariableScope(studio.variables, activeConfigOverrides(studio)));
+  });
+  useEffect(() => {
+    useSketchStore.getState().setVarScope(JSON.parse(scopeKey));
+  }, [scopeKey]);
 
   // Global undo/redo shortcuts: the feature tree in 3D mode, the sketch's own
   // history in sketch mode. Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Ctrl+Y = redo.
@@ -107,7 +119,9 @@ export default function App() {
           return;
         }
         if (e.key === "Escape") {
-          sk.setTool("select");
+          // Esc first cancels a dimension being placed, else exits the tool.
+          if (sk.dimension) sk.cancelDimension();
+          else sk.setTool("select");
         } else if (map[key]) {
           sk.setTool(map[key]);
         }

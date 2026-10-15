@@ -8,9 +8,10 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test:solver": "node --experimental-strip-types src/sketch/solver.test.ts",
-    "test:profile": "node --experimental-strip-types src/sketch/profile.test.ts",
-    "test:interaction": "node --experimental-strip-types src/sketch/interaction.test.ts",
+    "test:solver": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/sketch/solver.test.ts",
+    "test:profile": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/sketch/profile.test.ts",
+    "test:interaction": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/sketch/interaction.test.ts",
+    "test:distance": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/sketch/distance.test.ts",
     "test:delete": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/sketch/deleteCascade.test.ts",
     "test:regen": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/kernel/regen.test.ts",
     "test:robot": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/model/robot.test.ts",
@@ -31,7 +32,7 @@
     "test:plantcut": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/plant/nozzleCut.test.ts",
     "test:plantchat": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/commands/plantRegistry.test.ts",
     "test:cfdof": "node --experimental-strip-types --import ./src/test/ts-resolve.mjs src/cfd/openfoam.integration.test.ts",
-    "test": "npm run test:solver && npm run test:profile && npm run test:interaction && npm run test:delete && npm run test:regen && npm run test:robot && npm run test:commands && npm run test:chat && npm run test:proxy && npm run test:bim && npm run test:bimgeom && npm run test:wallcut && npm run test:cascade && npm run test:ifc && npm run test:bimchat && npm run test:cfd && npm run test:cfdcase && npm run test:cfdchat && npm run test:cfdapi && npm run test:plant && npm run test:plantcut && npm run test:plantchat"
+    "test": "npm run test:solver && npm run test:profile && npm run test:interaction && npm run test:delete && npm run test:distance && npm run test:regen && npm run test:robot && npm run test:commands && npm run test:chat && npm run test:proxy && npm run test:bim && npm run test:bimgeom && npm run test:wallcut && npm run test:cascade && npm run test:ifc && npm run test:bimchat && npm run test:cfd && npm run test:cfdcase && npm run test:cfdchat && npm run test:cfdapi && npm run test:plant && npm run test:plantcut && npm run test:plantchat"
   },
   "dependencies": {
     "occt-wasm": "^4.4.0",

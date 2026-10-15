@@ -21,13 +21,25 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSketchStore } from "./sketchStore";
 import { boxFromCorners, boxSelect } from "./boxSelect";
 import { previewGeometry, snapCursor, type PreviewShape, type Vec } from "./preview";
-import type {
-  ArcEntity,
-  CircleEntity,
-  EllipseEntity,
-  LineEntity,
-  Sketch,
-  SplineEntity,
+import {
+  AXIS_LABEL,
+  inferAxis,
+  layoutDimension,
+  measure,
+  placementOffset,
+  type DimensionLayout,
+} from "./dimension";
+import { displayValue } from "./sketchExprs";
+import {
+  ORIGIN_ID,
+  distanceAxis,
+  type ArcEntity,
+  type CircleEntity,
+  type DistanceAxis,
+  type EllipseEntity,
+  type LineEntity,
+  type Sketch,
+  type SplineEntity,
 } from "../model/sketch";
 
 interface View {
@@ -48,6 +60,13 @@ export function SketchCanvas() {
   const selectBox = useSketchStore((s) => s.selectBox);
   const pending = useSketchStore((s) => s.pending);
   const polygonSides = useSketchStore((s) => s.polygonSides);
+  const dimension = useSketchStore((s) => s.dimension);
+  const placeDimension = useSketchStore((s) => s.placeDimension);
+  const setDimensionOffset = useSketchStore((s) => s.setDimensionOffset);
+  /** Constraint whose value editor is open (set right after placing a dim). */
+  const [editingDim, setEditingDim] = useState<string | null>(null);
+  /** Dragging a placed dimension's line to reposition it. */
+  const dimDragRef = useRef<{ id: string } | null>(null);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
@@ -128,6 +147,17 @@ export function SketchCanvas() {
             y1: e.clientY - rect.top,
           });
         }
+      } else if (dimDragRef.current) {
+        const sk = useSketchStore.getState().sketch;
+        const c = sk?.constraints.find((x) => x.id === dimDragRef.current!.id);
+        if (sk && c?.type === "distance") {
+          const a = sk.points.find((p) => p.id === c.p1);
+          const b = sk.points.find((p) => p.id === c.p2);
+          const [u, v] = eventToPlane(e);
+          if (a && b) {
+            setDimensionOffset(c.id, placementOffset(a, b, { u, v }, distanceAxis(c)));
+          }
+        }
       } else if (dragRef.current) {
         const [u, v] = eventToPlane(e);
         dragPoint(dragRef.current.pointId, u, v);
@@ -160,6 +190,7 @@ export function SketchCanvas() {
       }
       dragRef.current = null;
       panRef.current = null;
+      dimDragRef.current = null;
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -211,6 +242,24 @@ export function SketchCanvas() {
     const [u, v] = eventToPlane(e);
     const hit = findHitPoint(u, v);
 
+    // Placing a distance: this click commits the previewed mode, then the
+    // value editor opens on the new dimension.
+    if (dimension) {
+      // Keep the browser from moving focus to <body> on this mousedown;
+      // otherwise it would immediately blur (and commit) the value editor
+      // that opens for the new dimension.
+      e.preventDefault();
+      const a = sketch.points.find((p) => p.id === dimension.p1);
+      const b = sketch.points.find((p) => p.id === dimension.p2);
+      if (a && b) {
+        const c = { u, v };
+        const axis = inferAxis(a, b, c, 4 / view.scale);
+        const id = placeDimension(axis, placementOffset(a, b, c, axis));
+        if (id) setEditingDim(id);
+      }
+      return;
+    }
+
     if (tool === "select") {
       if (hit) {
         selectPoint(hit, e.shiftKey);
@@ -242,6 +291,24 @@ export function SketchCanvas() {
   }
   const boxIsWindow = box ? box.x1 >= box.x0 : true;
 
+  // Distance placement preview: mode follows the cursor (dimension.ts).
+  let dimPreview: { axis: DistanceAxis; a: Vec; b: Vec; offset: number; value: number } | null =
+    null;
+  if (dimension && cursor) {
+    const a = sketch.points.find((p) => p.id === dimension.p1);
+    const b = sketch.points.find((p) => p.id === dimension.p2);
+    if (a && b) {
+      const axis = inferAxis(a, b, cursor, 4 / view.scale);
+      dimPreview = {
+        axis,
+        a,
+        b,
+        offset: placementOffset(a, b, cursor, axis),
+        value: Math.abs(measure(a, b, axis)),
+      };
+    }
+  }
+
   return (
     <div className="relative h-full w-full">
       <svg
@@ -249,9 +316,9 @@ export function SketchCanvas() {
         className="h-full w-full cursor-crosshair select-none bg-neutral-900"
         onMouseDown={onMouseDown}
         onMouseMove={(e) => {
-          // Only track while a shape is in progress, so idle hovering
-          // doesn't re-render the whole sketch on every move.
-          if (!pending) {
+          // Only track while a shape or dimension is in progress, so idle
+          // hovering doesn't re-render the whole sketch on every move.
+          if (!pending && !dimension) {
             if (cursor) setCursor(null);
             return;
           }
@@ -293,10 +360,152 @@ export function SketchCanvas() {
             pointerEvents="none"
           />
         )}
+        <DimensionLines
+          sketch={sketch}
+          toScreen={toScreen}
+          scale={view.scale}
+          onLineMouseDown={(id) => {
+            if (tool === "select" && !dimension) dimDragRef.current = { id };
+          }}
+        />
+        {dimPreview && (
+          <DimensionGraphic
+            layout={layoutDimension(dimPreview.a, dimPreview.b, dimPreview.axis, dimPreview.offset, 0)}
+            toScreen={toScreen}
+            color={PREVIEW_STROKE}
+            dashed
+          />
+        )}
       </svg>
       {/* Dimension annotations as HTML overlays (editable inline). */}
-      <DimensionLabels sketch={sketch} toScreen={toScreen} />
+      <DimensionLabels
+        sketch={sketch}
+        toScreen={toScreen}
+        scale={view.scale}
+        editing={editingDim}
+        setEditing={setEditingDim}
+      />
+      {dimPreview &&
+        (() => {
+          const lay = layoutDimension(dimPreview.a, dimPreview.b, dimPreview.axis, dimPreview.offset, 0);
+          const [x, y] = toScreen(lay.label.u, lay.label.v);
+          return (
+            <div
+              style={{ left: x, top: y }}
+              className="pointer-events-none absolute -translate-x-1/2 -translate-y-[130%] whitespace-nowrap rounded bg-blue-950/90 px-1.5 py-0.5 text-[11px] text-blue-100"
+            >
+              {AXIS_LABEL[dimPreview.axis]} {fmtNum(dimPreview.value)}
+            </div>
+          );
+        })()}
     </div>
+  );
+}
+
+function fmtNum(n: number): string {
+  return String(Math.round(n * 1000) / 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Distance dimensions (extension lines + arrowed dimension line)
+// ---------------------------------------------------------------------------
+
+const DIM_COLOR = "#fbbf24";
+/** Default clearance (screen px) for dims without a stored offset (legacy). */
+const DIM_CLEARANCE_PX = 18;
+
+function DimensionGraphic({
+  layout,
+  toScreen,
+  color,
+  dashed = false,
+  onLineMouseDown,
+}: {
+  layout: DimensionLayout;
+  toScreen: (u: number, v: number) => [number, number];
+  color: string;
+  dashed?: boolean;
+  onLineMouseDown?: (e: React.MouseEvent) => void;
+}) {
+  const [x1, y1] = toScreen(layout.line[0].u, layout.line[0].v);
+  const [x2, y2] = toScreen(layout.line[1].u, layout.line[1].v);
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  // Arrowheads at both ends, pointing outward along the dimension line.
+  const arrow = (tx: number, ty: number, dx: number, dy: number) => {
+    const s = 7;
+    const w = 3;
+    const nx = -dy;
+    const ny = dx;
+    return `${tx},${ty} ${tx - dx * s + nx * w},${ty - dy * s + ny * w} ${tx - dx * s - nx * w},${ty - dy * s - ny * w}`;
+  };
+  const ux = len > 1e-6 ? (x2 - x1) / len : 1;
+  const uy = len > 1e-6 ? (y2 - y1) / len : 0;
+  return (
+    <g pointerEvents={onLineMouseDown ? undefined : "none"}>
+      {layout.ext.map(([p, q], i) => {
+        const [ax, ay] = toScreen(p.u, p.v);
+        const [bx, by] = toScreen(q.u, q.v);
+        return (
+          <line key={i} x1={ax} y1={ay} x2={bx} y2={by} stroke={color} strokeWidth={0.75} opacity={0.7} strokeDasharray={dashed ? "3 3" : undefined} />
+        );
+      })}
+      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth={1} strokeDasharray={dashed ? "5 3" : undefined} />
+      {len > 16 && (
+        <>
+          <polygon points={arrow(x1, y1, -ux, -uy)} fill={color} />
+          <polygon points={arrow(x2, y2, ux, uy)} fill={color} />
+        </>
+      )}
+      {onLineMouseDown && (
+        // Fat invisible hit target for dragging the dimension line.
+        <line
+          x1={x1}
+          y1={y1}
+          x2={x2}
+          y2={y2}
+          stroke="transparent"
+          strokeWidth={10}
+          className="cursor-move"
+          onMouseDown={(e) => {
+            e.stopPropagation();
+            onLineMouseDown(e);
+          }}
+        />
+      )}
+    </g>
+  );
+}
+
+function DimensionLines({
+  sketch,
+  toScreen,
+  scale,
+  onLineMouseDown,
+}: {
+  sketch: Sketch;
+  toScreen: (u: number, v: number) => [number, number];
+  scale: number;
+  onLineMouseDown: (constraintId: string) => void;
+}) {
+  return (
+    <>
+      {sketch.constraints.map((c) => {
+        if (c.type !== "distance") return null;
+        const a = sketch.points.find((p) => p.id === c.p1);
+        const b = sketch.points.find((p) => p.id === c.p2);
+        if (!a || !b) return null;
+        const layout = layoutDimension(a, b, distanceAxis(c), c.offset, DIM_CLEARANCE_PX / scale);
+        return (
+          <DimensionGraphic
+            key={c.id}
+            layout={layout}
+            toScreen={toScreen}
+            color={DIM_COLOR}
+            onLineMouseDown={() => onLineMouseDown(c.id)}
+          />
+        );
+      })}
+    </>
   );
 }
 
@@ -603,6 +812,16 @@ function SketchGeometry({
       {sketch.points.map((p) => {
         const [x, y] = toScreen(p.u, p.v);
         const sel = selectedPoints.includes(p.id);
+        if (p.id === ORIGIN_ID) {
+          // Fixed sketch origin: a ringed marker so it reads as reference
+          // geometry. Pickable like any point (for dimensions), never draggable.
+          return (
+            <g key={p.id} aria-label="Sketch origin">
+              <circle cx={x} cy={y} r={sel ? 7 : 6} fill="none" stroke={sel ? "#facc15" : "#9ca3af"} strokeWidth={1.5} />
+              <circle cx={x} cy={y} r={2} fill={sel ? "#facc15" : "#9ca3af"} />
+            </g>
+          );
+        }
         return (
           <circle
             key={p.id}
@@ -685,20 +904,31 @@ interface DimLabel {
   id: string;
   x: number; // screen px
   y: number;
+  /** Displayed magnitude (|value| for horizontal/vertical distances). */
   value: number;
   suffix: string; // "" for distance/radius, "°" for angle
-  prefix: string; // "R" for radius, "" otherwise
+  prefix: string; // "R" for radius, "↔"/"↕" for horizontal/vertical, else ""
+  /** What the editor says it's setting, e.g. "Horizontal distance". */
+  kind: string;
+  expr?: string;
 }
 
 function DimensionLabels({
   sketch,
   toScreen,
+  scale,
+  editing,
+  setEditing,
 }: {
   sketch: Sketch;
   toScreen: (u: number, v: number) => [number, number];
+  scale: number;
+  editing: string | null;
+  setEditing: (id: string | null) => void;
 }) {
-  const updateConstraintValue = useSketchStore((s) => s.updateConstraintValue);
-  const [editing, setEditing] = useState<string | null>(null);
+  const setDimensionInput = useSketchStore((s) => s.setDimensionInput);
+  const varScope = useSketchStore((s) => s.varScope);
+  const [error, setError] = useState<string | null>(null);
 
   const pt = (id: string) => sketch.points.find((p) => p.id === id);
   const ent = (id: string) => sketch.entities.find((e) => e.id === id);
@@ -709,8 +939,19 @@ function DimensionLabels({
       const a = pt(c.p1);
       const b = pt(c.p2);
       if (!a || !b) continue;
-      const [x, y] = toScreen((a.u + b.u) / 2, (a.v + b.v) / 2);
-      labels.push({ id: c.id, x, y, value: c.value, suffix: "", prefix: "" });
+      const axis = distanceAxis(c);
+      const lay = layoutDimension(a, b, axis, c.offset, DIM_CLEARANCE_PX / scale);
+      const [x, y] = toScreen(lay.label.u, lay.label.v);
+      labels.push({
+        id: c.id,
+        x,
+        y,
+        value: displayValue(c),
+        suffix: "",
+        prefix: axis === "x" ? "↔ " : axis === "y" ? "↕ " : "",
+        kind: AXIS_LABEL[axis],
+        expr: c.expr,
+      });
     } else if (c.type === "angle") {
       const la = ent(c.a);
       if (!la || la.type !== "line") continue;
@@ -718,16 +959,23 @@ function DimensionLabels({
       const p2 = pt(la.p2);
       if (!p1 || !p2) continue;
       const [x, y] = toScreen((p1.u + p2.u) / 2, (p1.v + p2.v) / 2);
-      labels.push({ id: c.id, x, y, value: c.value, suffix: "°", prefix: "" });
+      labels.push({ id: c.id, x, y, value: c.value, suffix: "°", prefix: "", kind: "Angle", expr: c.expr });
     } else if (c.type === "radius") {
       const e = ent(c.entity);
       if (!e || (e.type !== "circle" && e.type !== "arc")) continue;
       const center = pt(e.center);
       if (!center) continue;
       const [x, y] = toScreen(center.u, center.v);
-      labels.push({ id: c.id, x, y, value: c.value, suffix: "", prefix: "R" });
+      labels.push({ id: c.id, x, y, value: c.value, suffix: "", prefix: "R", kind: "Radius", expr: c.expr });
     }
   }
+
+  const varNames = Object.keys(varScope);
+  const commitInput = (id: string, raw: string): boolean => {
+    const err = setDimensionInput(id, raw);
+    setError(err);
+    return err === null;
+  };
 
   return (
     <>
@@ -738,31 +986,69 @@ function DimensionLabels({
           className="absolute -translate-x-1/2 -translate-y-1/2"
         >
           {editing === l.id ? (
-            <input
-              autoFocus
-              type="number"
-              step="any"
-              defaultValue={l.value}
-              onBlur={(e) => {
-                updateConstraintValue(l.id, Number(e.target.value));
-                setEditing(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                if (e.key === "Escape") setEditing(null);
-              }}
-              className="w-16 rounded border border-blue-500 bg-neutral-900 px-1 text-center text-[11px] text-neutral-100 outline-none"
-            />
+            <div className="flex flex-col items-center gap-0.5">
+              {/* The mode is always named before the value is committed. */}
+              <span className="whitespace-nowrap rounded bg-neutral-950/90 px-1 text-[10px] text-neutral-300">
+                {l.kind}
+              </span>
+              <input
+                autoFocus
+                type="text"
+                aria-label={`${l.kind} value or expression`}
+                defaultValue={l.expr ?? String(Math.round(l.value * 1000) / 1000)}
+                onFocus={(e) => e.target.select()}
+                onBlur={(e) => {
+                  // Clicking away commits a valid entry; an invalid one is
+                  // discarded (the dimension keeps its previous value).
+                  commitInput(l.id, e.target.value);
+                  setError(null);
+                  setEditing(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    // Validate in place: on error, keep focus and the text
+                    // selected so the user can retype immediately.
+                    const input = e.target as HTMLInputElement;
+                    if (commitInput(l.id, input.value)) setEditing(null);
+                    else input.select();
+                  }
+                  if (e.key === "Escape") {
+                    setError(null);
+                    setEditing(null);
+                  }
+                }}
+                className={`w-24 rounded border bg-neutral-900 px-1 text-center text-[11px] text-neutral-100 outline-none ${
+                  error ? "border-red-500" : "border-blue-500"
+                }`}
+              />
+              {error ? (
+                <span role="alert" className="max-w-48 rounded bg-red-950/90 px-1 text-[10px] text-red-200">
+                  {error}
+                </span>
+              ) : (
+                varNames.length > 0 && (
+                  <span className="max-w-48 truncate rounded bg-neutral-950/90 px-1 text-[10px] text-neutral-400">
+                    vars: {varNames.join(", ")}
+                  </span>
+                )
+              )}
+            </div>
           ) : (
             <button
               type="button"
-              onClick={() => setEditing(l.id)}
+              onClick={() => {
+                setError(null);
+                setEditing(l.id);
+              }}
               className="rounded bg-neutral-800/90 px-1 text-[11px] text-amber-300 hover:bg-neutral-700"
-              title="Edit dimension"
+              title={`Edit ${l.kind.toLowerCase()}${l.expr ? ` (= ${l.expr})` : ""}`}
+              aria-label={`${l.kind} ${l.prefix.trim()}${Math.round(l.value * 1000) / 1000}${l.suffix}${l.expr ? `, driven by ${l.expr}` : ""}`}
             >
               {l.prefix}
               {Math.round(l.value * 1000) / 1000}
               {l.suffix}
+              {l.expr && <span className="ml-0.5 text-[9px] text-sky-300">ƒ</span>}
             </button>
           )}
         </div>
