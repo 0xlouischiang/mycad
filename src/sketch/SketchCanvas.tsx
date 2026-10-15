@@ -10,12 +10,17 @@
  *
  * Interaction:
  *   - select tool: click points/entities (shift = additive), drag points to
- *     re-solve live.
- *   - line/circle/arc tools: click to place (see sketchStore.clickAt).
+ *     re-solve live. Dragging on empty space box-selects (see boxSelect.ts):
+ *     left→right = window (fully inside), right→left = crossing (touching);
+ *     shift adds to the selection.
+ *   - drawing tools: click to place (see sketchStore.clickAt). Between clicks
+ *     a dashed live preview (see preview.ts) shows what the next click makes.
  *   - wheel = zoom about cursor, middle/space-drag = pan.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSketchStore } from "./sketchStore";
+import { boxFromCorners, boxSelect } from "./boxSelect";
+import { previewGeometry, snapCursor, type PreviewShape, type Vec } from "./preview";
 import type {
   ArcEntity,
   CircleEntity,
@@ -40,12 +45,31 @@ export function SketchCanvas() {
   const dragPoint = useSketchStore((s) => s.dragPoint);
   const selectPoint = useSketchStore((s) => s.selectPoint);
   const selectEntity = useSketchStore((s) => s.selectEntity);
+  const selectBox = useSketchStore((s) => s.selectBox);
+  const pending = useSketchStore((s) => s.pending);
+  const polygonSides = useSketchStore((s) => s.polygonSides);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
   const [view, setView] = useState<View>({ scale: 8, px: 0, py: 0 });
   const dragRef = useRef<{ pointId: string } | null>(null);
   const panRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+  /**
+   * Empty-space mousedown under the select tool. It only becomes a box once
+   * the pointer moves past BOX_THRESHOLD px; otherwise mouseup is a plain
+   * empty click (clears the selection, as before).
+   */
+  const boxRef = useRef<{
+    x: number;
+    y: number;
+    start: Vec;
+    additive: boolean;
+    active: boolean;
+  } | null>(null);
+  /** Live box-select rectangle in screen px (null when not box-selecting). */
+  const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  /** Cursor in plane coords while hovering the canvas (drives the live preview). */
+  const [cursor, setCursor] = useState<Vec | null>(null);
 
   // Track container size.
   useEffect(() => {
@@ -90,7 +114,21 @@ export function SketchCanvas() {
   // Global mousemove/up for dragging + panning.
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
-      if (dragRef.current) {
+      const b = boxRef.current;
+      if (b) {
+        if (!b.active && Math.hypot(e.clientX - b.x, e.clientY - b.y) > BOX_THRESHOLD) {
+          b.active = true;
+        }
+        if (b.active) {
+          const rect = svgRef.current!.getBoundingClientRect();
+          setBox({
+            x0: b.x - rect.left,
+            y0: b.y - rect.top,
+            x1: e.clientX - rect.left,
+            y1: e.clientY - rect.top,
+          });
+        }
+      } else if (dragRef.current) {
         const [u, v] = eventToPlane(e);
         dragPoint(dragRef.current.pointId, u, v);
       } else if (panRef.current) {
@@ -103,7 +141,23 @@ export function SketchCanvas() {
         }));
       }
     };
-    const onUp = () => {
+    const onUp = (e: MouseEvent) => {
+      const b = boxRef.current;
+      if (b) {
+        boxRef.current = null;
+        setBox(null);
+        const sk = useSketchStore.getState().sketch;
+        if (b.active && sk) {
+          const [u, v] = eventToPlane(e);
+          // Window when dragged rightward on screen, crossing when leftward.
+          const mode = e.clientX >= b.x ? "window" : "crossing";
+          const hit = boxSelect(sk, boxFromCorners(b.start, { u, v }), mode);
+          selectBox(hit.points, hit.entities, b.additive);
+        } else {
+          // Below the drag threshold: same as the old empty click.
+          clickAt(b.start.u, b.start.v, null);
+        }
+      }
       dragRef.current = null;
       panRef.current = null;
     };
@@ -113,7 +167,7 @@ export function SketchCanvas() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [dragPoint, eventToPlane]);
+  }, [dragPoint, eventToPlane, selectBox, clickAt]);
 
   const onWheel = (e: React.WheelEvent) => {
     const rect = svgRef.current!.getBoundingClientRect();
@@ -162,7 +216,14 @@ export function SketchCanvas() {
         selectPoint(hit, e.shiftKey);
         dragRef.current = { pointId: hit };
       } else {
-        clickAt(u, v, null); // clears selection on empty click
+        // Empty space: decide click vs box-select on mouseup / first move.
+        boxRef.current = {
+          x: e.clientX,
+          y: e.clientY,
+          start: { u, v },
+          additive: e.shiftKey,
+          active: false,
+        };
       }
     } else {
       clickAt(u, v, hit);
@@ -171,12 +232,33 @@ export function SketchCanvas() {
 
   if (!sketch) return null;
 
+  // Live preview of the in-progress shape (render-only; clickAt commits).
+  let previewShapes: PreviewShape[] = [];
+  let snapTarget: Vec | null = null;
+  if (cursor && pending && tool !== "select") {
+    const snapped = snapCursor(sketch, cursor, findHitPoint(cursor.u, cursor.v));
+    if (snapped !== cursor) snapTarget = snapped;
+    previewShapes = previewGeometry(sketch, pending, cursor, snapped, polygonSides);
+  }
+  const boxIsWindow = box ? box.x1 >= box.x0 : true;
+
   return (
     <div className="relative h-full w-full">
       <svg
         ref={svgRef}
         className="h-full w-full cursor-crosshair select-none bg-neutral-900"
         onMouseDown={onMouseDown}
+        onMouseMove={(e) => {
+          // Only track while a shape is in progress, so idle hovering
+          // doesn't re-render the whole sketch on every move.
+          if (!pending) {
+            if (cursor) setCursor(null);
+            return;
+          }
+          const [u, v] = eventToPlane(e);
+          setCursor({ u, v });
+        }}
+        onMouseLeave={() => setCursor(null)}
         onWheel={onWheel}
       >
         <Grid size={size} view={view} toScreen={toScreen} />
@@ -189,10 +271,117 @@ export function SketchCanvas() {
             if (tool === "select") selectEntity(id, additive);
           }}
         />
+        <PreviewLayer
+          shapes={previewShapes}
+          snapTarget={snapTarget}
+          toScreen={toScreen}
+          scale={view.scale}
+        />
+        {box && (
+          // Window = solid border, crossing = dashed (AutoCAD/SolidWorks cue).
+          // Color matches the existing selection highlight.
+          <rect
+            x={Math.min(box.x0, box.x1)}
+            y={Math.min(box.y0, box.y1)}
+            width={Math.abs(box.x1 - box.x0)}
+            height={Math.abs(box.y1 - box.y0)}
+            fill="#facc15"
+            fillOpacity={0.08}
+            stroke="#facc15"
+            strokeWidth={1}
+            strokeDasharray={boxIsWindow ? undefined : "5 3"}
+            pointerEvents="none"
+          />
+        )}
       </svg>
       {/* Dimension annotations as HTML overlays (editable inline). */}
       <DimensionLabels sketch={sketch} toScreen={toScreen} />
     </div>
+  );
+}
+
+/** Screen-px movement before an empty-space press becomes a box-select. */
+const BOX_THRESHOLD = 4;
+
+// ---------------------------------------------------------------------------
+// Live drawing preview
+// ---------------------------------------------------------------------------
+
+// Dashed blue matches the "in-progress" treatment used by the BIM/Plant
+// plan views (dashed preview stroke) and the sketch's own point color.
+const PREVIEW_STROKE = "#60a5fa";
+const PREVIEW_DASH = "6 4";
+
+function PreviewLayer({
+  shapes,
+  snapTarget,
+  toScreen,
+  scale,
+}: {
+  shapes: PreviewShape[];
+  /** Existing point the next click would snap onto, if any. */
+  snapTarget: Vec | null;
+  toScreen: (u: number, v: number) => [number, number];
+  scale: number;
+}) {
+  if (shapes.length === 0) return null;
+  const common = {
+    fill: "none",
+    stroke: PREVIEW_STROKE,
+    strokeWidth: 1.5,
+    strokeDasharray: PREVIEW_DASH,
+  } as const;
+  let snapRing: React.ReactNode = null;
+  if (snapTarget) {
+    const [x, y] = toScreen(snapTarget.u, snapTarget.v);
+    snapRing = <circle cx={x} cy={y} r={7} fill="none" stroke={PREVIEW_STROKE} strokeWidth={1.5} />;
+  }
+  return (
+    <g pointerEvents="none">
+      {shapes.map((sh, i) => {
+        if (sh.kind === "polyline") {
+          const pts = sh.pts.map((p) => toScreen(p.u, p.v).join(",")).join(" ");
+          return sh.closed ? (
+            <polygon key={i} points={pts} {...common} />
+          ) : (
+            <polyline key={i} points={pts} {...common} />
+          );
+        }
+        if (sh.kind === "circle") {
+          const [cx, cy] = toScreen(sh.c.u, sh.c.v);
+          return <circle key={i} cx={cx} cy={cy} r={sh.r * scale} {...common} />;
+        }
+        if (sh.kind === "ellipse") {
+          const [cx, cy] = toScreen(sh.c.u, sh.c.v);
+          const deg = (-sh.rotation * 180) / Math.PI;
+          return (
+            <ellipse
+              key={i}
+              cx={cx}
+              cy={cy}
+              rx={sh.rx * scale}
+              ry={sh.ry * scale}
+              transform={`rotate(${deg} ${cx} ${cy})`}
+              {...common}
+            />
+          );
+        }
+        return (
+          <ArcPath
+            key={i}
+            center={sh.c}
+            start={sh.start}
+            end={sh.end}
+            ccw={sh.ccw}
+            toScreen={toScreen}
+            stroke={PREVIEW_STROKE}
+            strokeWidth={1.5}
+            strokeDasharray={PREVIEW_DASH}
+          />
+        );
+      })}
+      {snapRing}
+    </g>
   );
 }
 
@@ -438,6 +627,7 @@ function ArcPath({
   toScreen,
   stroke,
   strokeWidth,
+  strokeDasharray,
   onMouseDown,
 }: {
   center: { u: number; v: number };
@@ -448,7 +638,9 @@ function ArcPath({
   toScreen: (u: number, v: number) => [number, number];
   stroke: string;
   strokeWidth: number;
-  onMouseDown: (e: React.MouseEvent) => void;
+  strokeDasharray?: string;
+  /** Omit for non-interactive (preview) arcs. */
+  onMouseDown?: (e: React.MouseEvent) => void;
 }) {
   const r = Math.hypot(start.u - center.u, start.v - center.v);
   const [sx, sy] = toScreen(start.u, start.v);
@@ -478,7 +670,8 @@ function ArcPath({
       fill="none"
       stroke={stroke}
       strokeWidth={strokeWidth}
-      className="cursor-pointer"
+      strokeDasharray={strokeDasharray}
+      className={onMouseDown ? "cursor-pointer" : undefined}
       onMouseDown={onMouseDown}
     />
   );

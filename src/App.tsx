@@ -47,20 +47,43 @@ export default function App() {
     void initKernel().then(() => restoreLast());
   }, [initKernel, restoreLast]);
 
-  // Global undo/redo shortcuts (3D mode only — sketch mode has its own history
-  // model later). Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Ctrl+Y = redo.
+  // Global undo/redo shortcuts: the feature tree in 3D mode, the sketch's own
+  // history in sketch mode. Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Ctrl+Y = redo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // Ignore when typing in an input (e.g. name fields, dimension edits).
+      // Ignore when typing in an input (e.g. name fields, dimension edits). In
+      // sketch mode this covers the inline dimension editor (SketchCanvas
+      // DimensionLabels), the polygon "sides" field, and the chat textarea, so
+      // Backspace edits text there instead of deleting geometry. The
+      // window.prompt dialogs (fillet radius, constraint values) are native
+      // and modal, so they never reach this listener.
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
         return;
       }
 
       // Sketch mode: single-key tool shortcuts (CAD convention).
       if (inSketchMode) {
-        if (e.metaKey || e.ctrlKey || e.altKey) return;
         const sk = useSketchStore.getState();
+        // Sketch-local undo/redo (the 3D tree history is untouched while sketching).
+        if ((e.metaKey || e.ctrlKey) && !e.altKey) {
+          const k = e.key.toLowerCase();
+          if (k === "z" && !e.shiftKey) {
+            e.preventDefault();
+            sk.undo();
+          } else if ((k === "z" && e.shiftKey) || k === "y") {
+            e.preventDefault();
+            sk.redo();
+          }
+          return;
+        }
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
         const map: Record<string, Parameters<typeof sk.setTool>[0]> = {
           v: "select",
           l: "line",
@@ -73,6 +96,16 @@ export default function App() {
           p: "spline",
         };
         const key = e.key.toLowerCase();
+        // Delete/Backspace = the toolbar's Delete button (same handler, same
+        // selection, same orphan cascade, one undo step). With nothing
+        // selected it's a no-op and the key's default is left alone.
+        if (e.key === "Delete" || e.key === "Backspace") {
+          if (sk.selectedPoints.length > 0 || sk.selectedEntities.length > 0) {
+            e.preventDefault();
+            sk.deleteSelected();
+          }
+          return;
+        }
         if (e.key === "Escape") {
           sk.setTool("select");
         } else if (map[key]) {

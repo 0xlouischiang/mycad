@@ -21,6 +21,8 @@ import {
   type SketchPlaneId,
 } from "../model/sketch";
 import { solveSketch } from "./solver";
+import { SNAP } from "./preview";
+import { applyCascade, collectCascade } from "./deleteCascade";
 
 /** Drawing tools. "select" is the default idle/edit tool. */
 export type SketchTool =
@@ -86,6 +88,11 @@ interface SketchStore {
 
   selectPoint: (pointId: string, additive: boolean) => void;
   selectEntity: (entityId: string, additive: boolean) => void;
+  /**
+   * Box-select result: replace the selection, or (additive) union it into the
+   * current one. Unlike additive click-select this never toggles items off.
+   */
+  selectBox: (pointIds: string[], entityIds: string[], additive: boolean) => void;
   clearSelection: () => void;
 
   /** Add a constraint from the current selection; returns error msg or null. */
@@ -110,22 +117,73 @@ interface SketchStore {
    */
   addSketchMirror: (mirrorLineId: string) => string | null;
 
+  /**
+   * Delete the selection plus everything that depends on it or is orphaned
+   * by it (see deleteCascade.ts). One undo step.
+   */
   deleteSelected: () => void;
   resolve: () => void;
+
+  /** Sketch-local undo/redo (snapshot per commit; drags coalesce). */
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
-/** Snap-together tolerance: clicks within this of an existing point reuse it. */
-const SNAP = 2.0;
+/**
+ * Sketch undo history. Module-level and transient, like the 3D store's
+ * per-tab history: snapshots of the sketch taken BEFORE each commit. Reset on
+ * entering/leaving sketch mode, so it covers the current editing session only.
+ */
+const HISTORY_LIMIT = 100;
+const COALESCE_MS = 500;
+const history: { undo: Sketch[]; redo: Sketch[]; lastKey: string | null; lastAt: number } = {
+  undo: [],
+  redo: [],
+  lastKey: null,
+  lastAt: 0,
+};
+function resetHistory() {
+  history.undo = [];
+  history.redo = [];
+  history.lastKey = null;
+  history.lastAt = 0;
+}
+
+// Snap-together tolerance (clicks within this of an existing point reuse it)
+// lives in preview.ts so the live preview snaps exactly like a real click.
 
 export const useSketchStore = create<SketchStore>((set, get) => {
   // Id of the spline entity currently being drawn (grows as points are added).
   // A fresh id is minted whenever a spline is finished.
   let splineDraftId = newSketchId("sp");
 
-  /** Mutate the sketch immutably-at-the-top, re-solve, and store the result. */
-  const commit = (mutate: (s: Sketch) => void, pinned?: string[]) => {
+  /**
+   * Mutate the sketch immutably-at-the-top, re-solve, and store the result.
+   * Records an undo snapshot unless `undoKey` is null (no-op re-solves).
+   * Consecutive commits with the same non-default key within COALESCE_MS
+   * merge into one undo step (a point drag is one step, not one per move).
+   */
+  const commit = (
+    mutate: (s: Sketch) => void,
+    pinned?: string[],
+    undoKey: string | null = "edit",
+  ) => {
     const current = get().sketch;
     if (!current) return;
+    if (undoKey !== null) {
+      const now = Date.now();
+      const merge =
+        undoKey !== "edit" && history.lastKey === undoKey && now - history.lastAt < COALESCE_MS;
+      if (!merge) {
+        history.undo.push(structuredClone(current));
+        if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
+      }
+      history.redo = [];
+      history.lastKey = undoKey;
+      history.lastAt = now;
+    }
     // Deep-ish clone so React sees a new reference; points/entities/constraints
     // are plain data.
     const next: Sketch = {
@@ -139,7 +197,29 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     set({
       sketch: next,
       lastSolve: { converged: result.converged, residual: result.residual },
+      canUndo: history.undo.length > 0,
+      canRedo: history.redo.length > 0,
     });
+  };
+
+  /** Swap in a history snapshot (undo/redo) and tidy transient UI state. */
+  const restore = (snap: Sketch) => {
+    const result = solveSketch(snap);
+    const pts = new Set(snap.points.map((p) => p.id));
+    const ents = new Set(snap.entities.map((e) => e.id));
+    // In-progress tool state may reference ids that no longer exist, and the
+    // spline draft id may now name a restored (finished) spline.
+    splineDraftId = newSketchId("sp");
+    history.lastKey = null;
+    set((st) => ({
+      sketch: snap,
+      pending: null,
+      selectedPoints: st.selectedPoints.filter((id) => pts.has(id)),
+      selectedEntities: st.selectedEntities.filter((id) => ents.has(id)),
+      lastSolve: { converged: result.converged, residual: result.residual },
+      canUndo: history.undo.length > 0,
+      canRedo: history.redo.length > 0,
+    }));
   };
 
   const addPoint = (s: Sketch, u: number, v: number, fixed = false): string => {
@@ -163,10 +243,14 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     selectedEntities: [],
     pending: null,
     lastSolve: null,
+    canUndo: false,
+    canRedo: false,
     polygonSides: 6,
     setPolygonSides: (n) => set({ polygonSides: Math.max(3, Math.round(n)) }),
 
     enterSketch: (planeId, planeOffset = 0) => {
+      resetHistory();
+      set({ canUndo: false, canRedo: false });
       set({
         sketch: makeSketch(newSketchId("sk"), planeId, planeOffset),
         editingFeatureId: null,
@@ -179,6 +263,8 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     enterSketchOnFace: (plane) => {
+      resetHistory();
+      set({ canUndo: false, canRedo: false });
       // planeId is a placeholder; customPlane drives the actual mapping.
       const sketch = makeSketch(newSketchId("sk"), "XY", 0);
       sketch.customPlane = plane;
@@ -194,6 +280,8 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     editExisting: (featureId, sketch) => {
+      resetHistory();
+      set({ canUndo: false, canRedo: false });
       // Deep-clone so edits don't mutate the tree's copy until finish.
       const clone: Sketch = {
         ...sketch,
@@ -213,6 +301,8 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     finish: () => {
+      resetHistory();
+      set({ canUndo: false, canRedo: false });
       const { sketch, editingFeatureId } = get();
       if (!sketch) return null;
       set({
@@ -227,6 +317,8 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     exitSketch: () => {
+      resetHistory();
+      set({ canUndo: false, canRedo: false });
       set({
         sketch: null,
         editingFeatureId: null,
@@ -616,7 +708,7 @@ export const useSketchStore = create<SketchStore>((set, get) => {
           p.u = u;
           p.v = v;
         }
-      }, [pointId]);
+      }, [pointId], `drag:${pointId}`);
     },
 
     selectPoint: (pointId, additive) => {
@@ -645,6 +737,20 @@ export const useSketchStore = create<SketchStore>((set, get) => {
         return {
           selectedEntities,
           selectedPoints: additive ? state.selectedPoints : [],
+        };
+      });
+    },
+
+    selectBox: (pointIds, entityIds, additive) => {
+      set((state) => {
+        if (!additive) return { selectedPoints: pointIds, selectedEntities: entityIds };
+        const union = (cur: string[], add: string[]) => [
+          ...cur,
+          ...add.filter((id) => !cur.includes(id)),
+        ];
+        return {
+          selectedPoints: union(state.selectedPoints, pointIds),
+          selectedEntities: union(state.selectedEntities, entityIds),
         };
       });
     },
@@ -826,63 +932,38 @@ export const useSketchStore = create<SketchStore>((set, get) => {
     },
 
     deleteSelected: () => {
-      const { selectedPoints, selectedEntities } = get();
-      commit((s) => {
-        // Remove selected entities.
-        s.entities = s.entities.filter((e) => !selectedEntities.includes(e.id));
-        // Remove selected points and any entities/constraints referencing them.
-        const deadPoints = new Set(selectedPoints);
-        s.entities = s.entities.filter((e) => {
-          if (e.type === "line") return !deadPoints.has(e.p1) && !deadPoints.has(e.p2);
-          if (e.type === "circle" || e.type === "ellipse")
-            return !deadPoints.has(e.center);
-          if (e.type === "spline") return !e.points.some((p) => deadPoints.has(p));
-          return !deadPoints.has(e.center) && !deadPoints.has(e.start) && !deadPoints.has(e.end);
-        });
-        s.points = s.points.filter((p) => !deadPoints.has(p.id));
-        // Drop constraints referencing anything now gone.
-        const liveEntities = new Set(s.entities.map((e) => e.id));
-        const livePoints = new Set(s.points.map((p) => p.id));
-        s.constraints = s.constraints.filter((c) => constraintRefsAlive(c, liveEntities, livePoints));
-      });
+      const { sketch, selectedPoints, selectedEntities, pending } = get();
+      if (!sketch || (selectedPoints.length === 0 && selectedEntities.length === 0)) return;
+      const cascade = collectCascade(
+        sketch,
+        selectedPoints,
+        selectedEntities,
+        pending?.pointIds ?? [],
+      );
+      commit((s) => applyCascade(s, cascade));
+      // Everything selected is gone (selected items are always in the cascade).
       set({ selectedPoints: [], selectedEntities: [] });
     },
 
-    resolve: () => commit(() => {}),
+    resolve: () => commit(() => {}, undefined, null),
+
+    undo: () => {
+      const current = get().sketch;
+      const prev = history.undo.pop();
+      if (!current || !prev) return;
+      history.redo.push(structuredClone(current));
+      restore(prev);
+    },
+
+    redo: () => {
+      const current = get().sketch;
+      const next = history.redo.pop();
+      if (!current || !next) return;
+      history.undo.push(structuredClone(current));
+      restore(next);
+    },
   };
 });
-
-/** True if every id a constraint references still exists. */
-function constraintRefsAlive(
-  c: Constraint,
-  entities: Set<string>,
-  points: Set<string>,
-): boolean {
-  switch (c.type) {
-    case "coincident":
-    case "distance":
-      return points.has(c.p1) && points.has(c.p2);
-    case "horizontal":
-    case "vertical":
-      return entities.has(c.entity);
-    case "parallel":
-    case "perpendicular":
-    case "equalLength":
-    case "angle":
-    case "concentric":
-      return entities.has(c.a) && entities.has(c.b);
-    case "radius":
-      return entities.has(c.entity);
-    case "midpoint":
-      return points.has(c.point) && entities.has(c.line);
-    case "symmetric":
-      return points.has(c.p1) && points.has(c.p2) && entities.has(c.line);
-    case "tangent":
-      return entities.has(c.line) && entities.has(c.curve);
-    default:
-      return false;
-  }
-}
 
 /** Convenience re-export so UI can read plane definitions. */
 export { BASE_PLANES };
