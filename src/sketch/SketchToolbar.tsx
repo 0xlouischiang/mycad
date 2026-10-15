@@ -1,7 +1,9 @@
 /**
  * Sketch mode toolbar + constraint palette.
  *
- * Top row: drawing tools (select/line/circle/arc) + exit.
+ * Top row: drawing tools (select/line/circle/arc) + edit tools + exit.
+ * Tools and constraints render as icon buttons (see ToolIcon / IconButton);
+ * the `label` strings below are their accessible names and tooltip text.
  * Constraint buttons apply to the current selection; dimensioned constraints
  * (distance/angle/radius) prompt for a value. A status line shows solver
  * convergence.
@@ -10,6 +12,8 @@ import { useState } from "react";
 import { useSketchStore, type SketchTool } from "./sketchStore";
 import { useStore } from "../store";
 import type { ConstraintType } from "../model/sketch";
+import { IconButton } from "./IconButton";
+import { ToolIcon } from "./ToolIcon";
 
 const TOOLS: { id: SketchTool; label: string; hint: string }[] = [
   { id: "select", label: "Select", hint: "Select / drag points (V)" },
@@ -92,20 +96,17 @@ export function SketchToolbar() {
         <span className="mr-2 text-xs font-semibold text-neutral-400">
           Sketch · {planeId}
         </span>
+        <div className="mr-1 h-5 w-px bg-neutral-700" />
         {TOOLS.map((t) => (
-          <button
+          <IconButton
             key={t.id}
-            type="button"
-            title={t.hint}
+            label={t.label}
+            active={tool === t.id}
+            tooltipSide="bottom"
             onClick={() => setTool(t.id)}
-            className={`rounded px-2 py-1 text-xs transition ${
-              tool === t.id
-                ? "bg-blue-600 text-white"
-                : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
-            }`}
           >
-            {t.label}
-          </button>
+            <ToolIcon name={t.id} />
+          </IconButton>
         ))}
         {tool === "polygon" && (
           <label className="flex items-center gap-1 text-xs text-neutral-400">
@@ -129,8 +130,9 @@ export function SketchToolbar() {
           </button>
         )}
         <div className="mx-1 h-5 w-px bg-neutral-700" />
-        <button
-          type="button"
+        <IconButton
+          label="Fillet…"
+          tooltipSide="bottom"
           onClick={() => {
             const raw = window.prompt("Fillet radius:");
             if (raw === null) return;
@@ -141,12 +143,12 @@ export function SketchToolbar() {
             }
             setMessage(addSketchFillet(r) ?? "Filleted corner");
           }}
-          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
         >
-          Fillet…
-        </button>
-        <button
-          type="button"
+          <ToolIcon name="fillet" />
+        </IconButton>
+        <IconButton
+          label="Mirror"
+          tooltipSide="bottom"
           onClick={() => {
             // Convention: last-selected entity is the mirror line.
             const sel = useSketchStore.getState().selectedEntities;
@@ -156,17 +158,12 @@ export function SketchToolbar() {
             }
             setMessage(addSketchMirror(sel[sel.length - 1]) ?? "Mirrored");
           }}
-          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
         >
-          Mirror
-        </button>
-        <button
-          type="button"
-          onClick={deleteSelected}
-          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-red-900"
-        >
-          Delete
-        </button>
+          <ToolIcon name="mirror" />
+        </IconButton>
+        <IconButton label="Delete" danger tooltipSide="bottom" onClick={deleteSelected}>
+          <ToolIcon name="delete" />
+        </IconButton>
         <button
           type="button"
           onClick={exitSketch}
@@ -188,25 +185,15 @@ export function SketchToolbar() {
           Constrain
         </span>
         {GEOMETRIC.map((c) => (
-          <button
-            key={c.type}
-            type="button"
-            onClick={() => apply(c.type)}
-            className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
-          >
-            {c.label}
-          </button>
+          <IconButton key={c.type} label={c.label} onClick={() => apply(c.type)}>
+            <ToolIcon name={c.type} />
+          </IconButton>
         ))}
         <div className="mx-1 h-5 w-px bg-neutral-700" />
         {DIMENSIONAL.map((c) => (
-          <button
-            key={c.type}
-            type="button"
-            onClick={() => apply(c.type, c.prompt)}
-            className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
-          >
-            {c.label}…
-          </button>
+          <IconButton key={c.type} label={`${c.label}…`} onClick={() => apply(c.type, c.prompt)}>
+            <ToolIcon name={c.type} />
+          </IconButton>
         ))}
       </div>
 
